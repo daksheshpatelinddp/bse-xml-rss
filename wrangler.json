@@ -1,0 +1,19 @@
+{
+  "name": "bse-xml-rss",
+  "main": "worker.js",
+  "compatibility_date": "2026-08-24",
+  "kv_namespaces": [
+    {
+      "binding": "BSE_XML_RSS_DATA",
+      "id": "0b2d08e2946e4ee59b37719abde96e5f"
+    }
+  ],
+  "triggers": {
+    "crons": [
+      "* 0-15 * * 1-5"
+    ]
+  },
+  "observability": {
+    "enabled": true
+  }
+}
