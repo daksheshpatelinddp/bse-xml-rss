@@ -7,7 +7,273 @@
  *
  * KV binding: BSE_XML_RSS_DATA
  * Secrets / Vars: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, NTFY_TOPIC
- * Cron: every 1 min, 00:00–16:59 UTC, Mon–Fri  ≈ 05:30–22:29 IST
+ * Cron: /*
+ * BSE XML RSS – V1.1 (Fixed)
+ * - Official BSE RSS (XML)
+ * - Original fetchedAt is permanent
+ * - Alerts only for new watchlist matches
+ *
+ * KV binding: BSE_XML_RSS_DATA
+ * Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, NTFY_TOPIC
+ */
+
+const BSE_RSS_URL = "https://www.bseindia.com/data/xml/announcements.xml";
+
+const MAX_RECENT_SEEN = 800;
+const MAX_ALERTS = 500;
+const MAX_RECENT_ANNOUNCEMENTS = 150;
+
+const BURST_POLLS = 3;
+const BURST_GAP_MS = 18000;
+
+const CORS_HEADERS = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
+};
+
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: { "Content-Type": "application/json; charset=utf-8", ...CORS_HEADERS },
+  });
+}
+
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function normalizeBseLink(rawLink) {
+  var clean = String(rawLink || "").trim();
+  if (!clean) return "https://www.bseindia.com";
+  if (clean.indexOf("AttachLive") !== -1 || clean.indexOf("AttachHis") !== -1) {
+    var fileName = clean.split("/").pop();
+    if (fileName) return "https://www.bseindia.com/xml-data/corpfiling/AttachLive/" + fileName;
+  }
+  if (clean.indexOf("http") !== 0) {
+    return clean.indexOf("/") === 0 ? "https://www.bseindia.com" + clean : "https://www.bseindia.com/" + clean;
+  }
+  return clean;
+}
+
+function escapeTelegramHtml(text) {
+  return String(text || "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
+}
+
+async function sendTelegramAlert(title, body, scrip, link, fetchedAt, env) {
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return false;
+  var pdfLink = normalizeBseLink(link);
+  var targetLink =
+    pdfLink && pdfLink !== "https://www.bseindia.com"
+      ? pdfLink
+      : scrip
+        ? "https://www.bseindia.com/stock-share-price/" + scrip
+        : "https://www.bseindia.com";
+  const formattedFetchTime = fetchedAt
+    ? new Date(fetchedAt).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" })
+    : "N/A";
+  const messageText = `🔔 <b>${escapeTelegramHtml(title)}</b>\n\n${escapeTelegramHtml(body)}\n\n⏱ <b>Fetched:</b> ${formattedFetchTime}\n📎 <a href="${targetLink}">View</a>`;
+  try {
+    const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: env.TELEGRAM_CHAT_ID,
+        text: messageText,
+        parse_mode: "HTML",
+        disable_web_page_preview: false,
+      }),
+    });
+    return res.ok;
+  } catch (err) {
+    console.error("Telegram error:", err);
+    return false;
+  }
+}
+
+async function sendNtfyAlert(title, body, scrip, link, fetchedAt, env) {
+  if (!env.NTFY_TOPIC) return false;
+  var pdfLink = normalizeBseLink(link);
+  var targetLink =
+    pdfLink && pdfLink !== "https://www.bseindia.com"
+      ? pdfLink
+      : scrip
+        ? "https://www.bseindia.com/stock-share-price/" + scrip
+        : "https://www.bseindia.com";
+  const formattedFetchTime = fetchedAt
+    ? new Date(fetchedAt).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" })
+    : "N/A";
+  try {
+    const res = await fetch(`https://ntfy.sh/${env.NTFY_TOPIC}`, {
+      method: "POST",
+      headers: {
+        Title: title,
+        Click: targetLink,
+        Tags: "chart_with_upwards_trend,warning",
+      },
+      body: `${body}\nFetched: ${formattedFetchTime}`,
+    });
+    return res.ok;
+  } catch (err) {
+    console.error("ntfy error:", err);
+    return false;
+  }
+}
+
+/* ---------- RSS helpers ---------- */
+
+function parsePubDateRss(raw) {
+  if (!raw) return "";
+  const s = String(raw).trim();
+  try {
+    const m = s.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{4})\s+(\d{1,2}):(\d{2}):(\d{2})$/);
+    if (m) {
+      const months = { Jan:0,Feb:1,Mar:2,Apr:3,May:4,Jun:5,Jul:6,Aug:7,Sep:8,Oct:9,Nov:10,Dec:11 };
+      const mon = months[m[2]];
+      if (mon !== undefined) {
+        const d = new Date(Date.UTC(+m[3], mon, +m[1], +m[4] - 5, +m[5] - 30, +m[6]));
+        if (!isNaN(d.getTime())) return d.toISOString();
+      }
+    }
+    const d = new Date(s);
+    if (!isNaN(d.getTime())) return d.toISOString();
+  } catch (e) {}
+  return s;
+}
+
+function extractScripFromTitle(title) {
+  const m = String(title || "").match(/\((\d{6,})\)\s*$/);
+  return m ? m[1] : "";
+}
+
+function extractCompanyFromTitle(title) {
+  return String(title || "").replace(/\s*\(\d{6,}\)\s*$/, "").trim() || "Company";
+}
+
+function computeFingerprint(item) {
+  const link = String(item.link || "").trim().toLowerCase();
+  if (link) {
+    const file = link.split("/").pop();
+    if (file && file.length > 8) return `att:${file}`;
+  }
+  const scrip = String(item.scripcode || extractScripFromTitle(item.title) || "").trim();
+  const desc = String(item.description || "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120);
+  const day = String(item.pubDate || "").slice(0, 10);
+  return `st:${scrip}|${desc}|${day}`;
+}
+
+function matchesWatchlist(item, watchlist) {
+  if (!watchlist || !watchlist.length) return false;
+  const itemScrip = String(item.scripcode || extractScripFromTitle(item.title) || "").trim();
+  const itemCompany = extractCompanyFromTitle(item.title).toLowerCase();
+
+  for (let i = 0; i < watchlist.length; i++) {
+    const w = watchlist[i];
+    const ws = String(w.scrip || "").trim();
+    if (ws && itemScrip && ws === itemScrip) return true;
+    const wn = String(w.name || "").toLowerCase().trim();
+    if (wn.length >= 3 && itemCompany && itemCompany.indexOf(wn) !== -1) return true;
+  }
+  return false;
+}
+
+function itemToAnnouncement(item, fetchedAt, isAlert) {
+  const company = extractCompanyFromTitle(item.title);
+  const scrip = String(item.scripcode || extractScripFromTitle(item.title) || "").trim();
+  const title = String(item.description || item.title || "New Announcement").trim();
+  const link = normalizeBseLink(item.link);
+
+  return {
+    company,
+    scrip,
+    title,
+    link,
+    fingerprint: computeFingerprint(item),
+    pubDate: parsePubDateRss(item.pubDate),
+    fetchedAt,
+    alert: !!isAlert,
+  };
+}
+
+function parseRssItems(xmlText) {
+  const items = [];
+  const itemBlocks = xmlText.split(/<item>/i).slice(1);
+
+  for (const block of itemBlocks) {
+    const end = block.indexOf("</item>");
+    const content = end === -1 ? block : block.slice(0, end);
+
+    function tag(name) {
+      const re = new RegExp(`<${name}[^>]*>([\\s\\S]*?)</${name}>`, "i");
+      const m = content.match(re);
+      if (!m) return "";
+      return m[1]
+        .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/gi, "$1")
+        .replace(/&amp;/g, "&")
+        .replace(/&lt;/g, "<")
+        .replace(/&gt;/g, ">")
+        .replace(/&quot;/g, '"')
+        .replace(/&#39;/g, "'")
+        .trim();
+    }
+
+    const title = tag("title");
+    const link = tag("link");
+    const description = tag("description");
+    const pubDate = tag("pubDate");
+    const scripcode = tag("scripcode");
+
+    if (!title && !description) continue;
+    items.push({ title, link, description, pubDate, scripcode });
+  }
+  return items;
+}
+
+/* ---------- KV helpers ---------- */
+
+async function getWatchlist(env) {
+  if (!env.BSE_XML_RSS_DATA) return [];
+  const data = await env.BSE_XML_RSS_DATA.get("watchlist", "json");
+  return Array.isArray(data) ? data : [];
+}
+
+async function setWatchlist(env, watchlist) {
+  if (!env.BSE_XML_RSS_DATA) throw new Error("BSE_XML_RSS_DATA is not bound.");
+  await env.BSE_XML_RSS_DATA.put("watchlist", JSON.stringify(watchlist));
+}
+
+async function getNotificationSettings(env) {
+  if (!env.BSE_XML_RSS_DATA) return { telegram: true, ntfy: true };
+  const data = await env.BSE_XML_RSS_DATA.get("notificationSettings", "json");
+  return data || { telegram: true, ntfy: true };
+}
+
+async function setNotificationSettings(env, settings) {
+  if (!env.BSE_XML_RSS_DATA) throw new Error("BSE_XML_RSS_DATA is not bound.");
+  await env.BSE_XML_RSS_DATA.put("notificationSettings", JSON.stringify(settings));
+}
+
+async function getRecentSeen(env) {
+  if (!env.BSE_XML_RSS_DATA) return [];
+  const data = await env.BSE_XML_RSS_DATA.get("recentSeen", "json");
+  return Array.isArray(data) ? data : [];
+}
+
+async function saveRecentSeen(env, ids) {
+  if (!env.BSE_XML_RSS_DATA) return;
+  await env.BSE_XML_RSS_DATA.put("recentSeen", JSON.stringify(ids.slice(0, MAX_RECENT_SEEN)));
+}
+
+async function getAlertFingerprints(env) {
+  if (!env.BSE_XML_RSS_DATA) return [];
+  const data = await env.BSE_XML_RSS_DATA.get("alertFingerprints",  1 min, 00:00–16:59 UTC, Mon–Fri  ≈ 05:30–22:29 IST
  */
 
 const BSE_RSS_URL = "https://www.bseindia.com/data/xml/announcements.xml";
