@@ -544,10 +544,29 @@ export default {
         return json({ ok: true, categories: [] });
       }
 
-      if (url.pathname === "/clear-alert-fingerprints") {
-        await env.BSE_XML_RSS_DATA.put("alertFingerprints", "[]");
-        return json({ ok: true, message: "Alert fingerprints cleared. Next new matches will send notifications." });
-      }
+   if (url.pathname === "/clear-alert-fingerprints") {
+  await env.BSE_XML_RSS_DATA.put("alertFingerprints", "[]");
+  return json({ ok: true, message: "Alert fingerprints cleared. Next new matches will send notifications." });
+}
+
+// Temporary force test – sends one Telegram + ntfy message
+if (url.pathname === "/test-alert") {
+  const title = "TEST ALERT – BSE XML RSS";
+  const body = "This is a forced test message. If you receive this, Telegram and ntfy are working correctly.";
+  const scrip = "000000";
+  const link = "https://www.bseindia.com";
+  const fetchedAt = new Date().toISOString();
+
+  const telegramOk = await sendTelegramAlert(title, body, scrip, link, fetchedAt, env);
+  const ntfyOk = await sendNtfyAlert(title, body, scrip, link, fetchedAt, env);
+
+  return json({
+    ok: true,
+    telegram: telegramOk,
+    ntfy: ntfyOk,
+    message: "Test alert sent. Check Telegram and ntfy."
+  });
+}
 
       return json({ error: "Not found" }, 404);
     } catch (err) {
