@@ -1,8 +1,9 @@
 /*
- * BSE XML RSS – V1.1 (Fixed)
+ * BSE XML RSS – V1.2
  * - Official BSE RSS (XML)
  * - Original fetchedAt is permanent
  * - Alerts only for new watchlist matches
+ * - Improved ntfy / Telegram error reporting
  *
  * KV binding: BSE_XML_RSS_DATA
  * Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, NTFY_TOPIC
@@ -55,7 +56,9 @@ function escapeTelegramHtml(text) {
 }
 
 async function sendTelegramAlert(title, body, scrip, link, fetchedAt, env) {
-  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return false;
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
+    return { ok: false, error: "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing" };
+  }
   var pdfLink = normalizeBseLink(link);
   var targetLink =
     pdfLink && pdfLink !== "https://www.bseindia.com"
@@ -78,15 +81,20 @@ async function sendTelegramAlert(title, body, scrip, link, fetchedAt, env) {
         disable_web_page_preview: false,
       }),
     });
-    return res.ok;
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      return { ok: false, status: res.status, error: txt.slice(0, 300) };
+    }
+    return { ok: true };
   } catch (err) {
-    console.error("Telegram error:", err);
-    return false;
+    return { ok: false, error: String(err) };
   }
 }
 
 async function sendNtfyAlert(title, body, scrip, link, fetchedAt, env) {
-  if (!env.NTFY_TOPIC) return false;
+  if (!env.NTFY_TOPIC) {
+    return { ok: false, error: "NTFY_TOPIC secret is missing or empty" };
+  }
   var pdfLink = normalizeBseLink(link);
   var targetLink =
     pdfLink && pdfLink !== "https://www.bseindia.com"
@@ -97,20 +105,27 @@ async function sendNtfyAlert(title, body, scrip, link, fetchedAt, env) {
   const formattedFetchTime = fetchedAt
     ? new Date(fetchedAt).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" })
     : "N/A";
+
+  const messageBody = `${body}\nFetched: ${formattedFetchTime}`;
+
   try {
-    const res = await fetch(`https://ntfy.sh/${env.NTFY_TOPIC}`, {
+    const res = await fetch(`https://ntfy.sh/${encodeURIComponent(env.NTFY_TOPIC)}`, {
       method: "POST",
       headers: {
-        Title: title,
+        Title: String(title).slice(0, 250),
         Click: targetLink,
         Tags: "chart_with_upwards_trend,warning",
+        Priority: "4",
       },
-      body: `${body}\nFetched: ${formattedFetchTime}`,
+      body: messageBody,
     });
-    return res.ok;
+    if (!res.ok) {
+      const txt = await res.text().catch(() => "");
+      return { ok: false, status: res.status, error: txt.slice(0, 300) };
+    }
+    return { ok: true };
   } catch (err) {
-    console.error("ntfy error:", err);
-    return false;
+    return { ok: false, error: String(err) };
   }
 }
 
@@ -123,6 +138,7 @@ function parsePubDateRss(raw) {
       const months = { Jan:0,Feb:1,Mar:2,Apr:3,May:4,Jun:5,Jul:6,Aug:7,Sep:8,Oct:9,Nov:10,Dec:11 };
       const mon = months[m[2]];
       if (mon !== undefined) {
+        // BSE times are IST (UTC+5:30)
         const d = new Date(Date.UTC(+m[3], mon, +m[1], +m[4] - 5, +m[5] - 30, +m[6]));
         if (!isNaN(d.getTime())) return d.toISOString();
       }
@@ -403,17 +419,18 @@ async function pollOnce(env) {
       const existingAnn = existingMap.get(fp);
       const alertFetchedAt = existingAnn && existingAnn.fetchedAt ? existingAnn.fetchedAt : fetchedAt;
 
-      let telegramOk = false;
-      let ntfyOk = false;
+      let telegramResult = { ok: false };
+      let ntfyResult = { ok: false };
 
       if (settings.telegram !== false) {
-        telegramOk = await sendTelegramAlert(`${company} (${scrip})`, title, scrip, link, alertFetchedAt, env);
+        telegramResult = await sendTelegramAlert(`${company} (${scrip})`, title, scrip, link, alertFetchedAt, env);
       }
       if (settings.ntfy !== false) {
-        ntfyOk = await sendNtfyAlert(`${company} (${scrip})`, title, scrip, link, alertFetchedAt, env);
+        ntfyResult = await sendNtfyAlert(`${company} (${scrip})`, title, scrip, link, alertFetchedAt, env);
       }
 
-      if (telegramOk || ntfyOk || (settings.telegram === false && settings.ntfy === false)) {
+      // Record the alert if at least one channel succeeded, or if both channels are disabled
+      if (telegramResult.ok || ntfyResult.ok || (settings.telegram === false && settings.ntfy === false)) {
         alerts.unshift({
           company,
           scrip,
@@ -497,8 +514,8 @@ export default {
         return json({
           status: "running",
           app: "BSE XML RSS",
-          version: "1.1",
-          note: "Original fetchedAt is permanent. Alerts only for new watchlist matches.",
+          version: "1.2",
+          note: "Original fetchedAt is permanent. Alerts only for new watchlist matches. Improved ntfy diagnostics.",
         });
       }
 
@@ -544,29 +561,30 @@ export default {
         return json({ ok: true, categories: [] });
       }
 
-   if (url.pathname === "/clear-alert-fingerprints") {
-  await env.BSE_XML_RSS_DATA.put("alertFingerprints", "[]");
-  return json({ ok: true, message: "Alert fingerprints cleared. Next new matches will send notifications." });
-}
+      if (url.pathname === "/clear-alert-fingerprints") {
+        await env.BSE_XML_RSS_DATA.put("alertFingerprints", "[]");
+        return json({ ok: true, message: "Alert fingerprints cleared. Next new matches will send notifications." });
+      }
 
-// Temporary force test – sends one Telegram + ntfy message
-if (url.pathname === "/test-alert") {
-  const title = "TEST ALERT – BSE XML RSS";
-  const body = "This is a forced test message. If you receive this, Telegram and ntfy are working correctly.";
-  const scrip = "000000";
-  const link = "https://www.bseindia.com";
-  const fetchedAt = new Date().toISOString();
+      // Diagnostic test endpoint – returns detailed status for both channels
+      if (url.pathname === "/test-alert") {
+        const title = "TEST ALERT – BSE XML RSS";
+        const body = "This is a forced test message. If you receive this, Telegram and ntfy are working correctly.";
+        const scrip = "000000";
+        const link = "https://www.bseindia.com";
+        const fetchedAt = new Date().toISOString();
 
-  const telegramOk = await sendTelegramAlert(title, body, scrip, link, fetchedAt, env);
-  const ntfyOk = await sendNtfyAlert(title, body, scrip, link, fetchedAt, env);
+        const telegramResult = await sendTelegramAlert(title, body, scrip, link, fetchedAt, env);
+        const ntfyResult = await sendNtfyAlert(title, body, scrip, link, fetchedAt, env);
 
-  return json({
-    ok: true,
-    telegram: telegramOk,
-    ntfy: ntfyOk,
-    message: "Test alert sent. Check Telegram and ntfy."
-  });
-}
+        return json({
+          ok: true,
+          telegram: telegramResult,
+          ntfy: ntfyResult,
+          message: "Test completed. Check the detailed status objects above and your Telegram / ntfy apps.",
+          tip: "If ntfy.ok is false and error mentions NTFY_TOPIC, run: wrangler secret put NTFY_TOPIC",
+        });
+      }
 
       return json({ error: "Not found" }, 404);
     } catch (err) {
