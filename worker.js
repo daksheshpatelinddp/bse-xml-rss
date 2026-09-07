@@ -25,7 +25,7 @@
 
 const BSE_RSS_URL = "https://www.bseindia.com/data/xml/announcements.xml";
 
-const MAX_RECENT_SEEN = 800;
+const MAX_RECENT_SEEN = 200;
 const MAX_ALERTS = 500;    // how many watchlist matches to retain in KV history
 const DISPLAY_LIMIT = 50;  // how many of those the frontend feed shows
 
