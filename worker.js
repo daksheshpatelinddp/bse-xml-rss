@@ -371,7 +371,7 @@ async function fetchRssItems() {
   return parseRssItems(xml);
 }
 
-async function pollOnce(env, cachedWatchlist) {
+async function pollOnce(env, cachedWatchlist, cachedRecentSeen) {
   const fetchedAt = new Date().toISOString();
   let items = [];
   try {
@@ -393,17 +393,19 @@ async function pollOnce(env, cachedWatchlist) {
     page.push({ item: it, fp });
   }
 
-  // Cheap "is anything new at all?" check. The only KV writes below
-  // (recentSeen, and alerts when a watchlist item matches) happen
-  // when something has actually changed — most polls end here.
-  const recentSeen = await getRecentSeen(env);
+  // Cheap "is anything new at all?" check. Within a burst, recentSeen is
+  // passed in from the previous poll's in-memory result instead of being
+  // re-read + re-parsed from KV every single poll — same data, far less
+  // repeated JSON work per cron tick.
+  const recentSeen = cachedRecentSeen || (await getRecentSeen(env));
   const seenSet = new Set(recentSeen);
 
   if (recentSeen.length === 0) {
     // Baseline run (first ever poll, or after a KV reset) — nothing
     // to alert on yet, just record what we've seen.
-    await saveRecentSeen(env, page.map((p) => p.fp));
-    return { ok: true, status: "baseline", newAnnouncements: 0, newAlerts: 0, rows: items.length };
+    const fps = page.map((p) => p.fp);
+    await saveRecentSeen(env, fps);
+    return { ok: true, status: "baseline", newAnnouncements: 0, newAlerts: 0, rows: items.length, updatedSeen: fps };
   }
 
   const newOnes = [];
@@ -412,7 +414,9 @@ async function pollOnce(env, cachedWatchlist) {
   }
 
   if (newOnes.length === 0) {
-    return { ok: true, newAnnouncements: 0, newAlerts: 0, rows: items.length };
+    // Nothing new — hand the same recentSeen array back unchanged so the
+    // burst loop can reuse it without another KV round trip.
+    return { ok: true, newAnnouncements: 0, newAlerts: 0, rows: items.length, updatedSeen: recentSeen };
   }
 
   const watchlist = cachedWatchlist || (await getWatchlist(env));
@@ -493,6 +497,7 @@ async function pollOnce(env, cachedWatchlist) {
     newAlerts: newAlertCount,
     rows: items.length,
     totalSeen: updatedSeen.length,
+    updatedSeen,
   };
 }
 
@@ -501,16 +506,20 @@ async function pollBurst(env) {
   let totalNew = 0;
   let totalAlerts = 0;
 
-  // Read once for the whole burst instead of once per poll — the
-  // watchlist rarely changes mid-burst, and this saves redundant
-  // KV reads + JSON.parse calls per cron tick.
+  // Read watchlist + recentSeen once for the whole burst instead of once
+  // per poll. The watchlist essentially never changes mid-burst. recentSeen
+  // DOES change poll-to-poll (new items get added to it), so instead of
+  // re-reading it from KV each time, we carry the in-memory `updatedSeen`
+  // that pollOnce already computed straight into the next call.
   const watchlist = await getWatchlist(env);
+  let recentSeen = await getRecentSeen(env);
 
   for (let i = 0; i < BURST_POLLS; i++) {
-    const r = await pollOnce(env, watchlist);
+    const r = await pollOnce(env, watchlist, recentSeen);
     results.push(r);
     totalNew += r.newAnnouncements || 0;
     totalAlerts += r.newAlerts || 0;
+    if (r.updatedSeen) recentSeen = r.updatedSeen;
     if (i < BURST_POLLS - 1) await sleep(BURST_GAP_MS);
   }
 
