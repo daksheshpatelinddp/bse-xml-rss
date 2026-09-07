@@ -1,9 +1,23 @@
 /*
- * BSE XML RSS – V1.2
- * - Official BSE RSS (XML)
- * - Original fetchedAt is permanent
- * - Alerts only for new watchlist matches
- * - Improved ntfy / Telegram error reporting
+ * BSE XML RSS – V1.3
+ * Alert-first monitor over the official BSE RSS (XML) feed.
+ *
+ * - Frontend shows only watchlist-matched announcements (last 50)
+ * - Sends Telegram / ntfy alerts ONLY for watchlist matches
+ * - Preserves original first-fetched time
+ * - Brought in line with the bse-fastest-jsonapi corrections:
+ *     - dropped the "all announcements" feed/KV store (this was the
+ *       single biggest CPU cost — an unconditional 150-item
+ *       JSON.stringify + KV put on every poll, even quiet ones)
+ *     - ntfy now uses its JSON publish API instead of custom headers
+ *       (non-ASCII title/body text was silently crashing the header-based
+ *       version before the request even went out)
+ *     - KV writes go through a retry-with-backoff wrapper (Workers KV
+ *       allows only 1 write/sec per key)
+ *     - watchlist is read once per burst and reused, and only fetched at
+ *       all once we know there's something new to check
+ *     - tag regexes for the RSS XML are compiled once at module scope
+ *       instead of per item/per field
  *
  * KV binding: BSE_XML_RSS_DATA
  * Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, NTFY_TOPIC
@@ -12,8 +26,8 @@
 const BSE_RSS_URL = "https://www.bseindia.com/data/xml/announcements.xml";
 
 const MAX_RECENT_SEEN = 800;
-const MAX_ALERTS = 500;
-const MAX_RECENT_ANNOUNCEMENTS = 150;
+const MAX_ALERTS = 500;    // how many watchlist matches to retain in KV history
+const DISPLAY_LIMIT = 50;  // how many of those the frontend feed shows
 
 const BURST_POLLS = 3;
 const BURST_GAP_MS = 18000;
@@ -23,6 +37,14 @@ const CORS_HEADERS = {
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
 };
+
+// Precompiled once at module load — reused across every item, every poll,
+// every invocation of this isolate. No `g` flag, so they are stateless and
+// safe to share.
+const RSS_TAG_NAMES = ["title", "link", "description", "pubDate", "scripcode"];
+const TAG_REGEXES = Object.fromEntries(
+  RSS_TAG_NAMES.map((name) => [name, new RegExp(`<${name}[^>]*>([\\s\\S]*?)</${name}>`, "i")])
+);
 
 function json(data, status = 200) {
   return new Response(JSON.stringify(data), {
@@ -56,9 +78,7 @@ function escapeTelegramHtml(text) {
 }
 
 async function sendTelegramAlert(title, body, scrip, link, fetchedAt, env) {
-  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) {
-    return { ok: false, error: "TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID missing" };
-  }
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return;
   var pdfLink = normalizeBseLink(link);
   var targetLink =
     pdfLink && pdfLink !== "https://www.bseindia.com"
@@ -71,7 +91,7 @@ async function sendTelegramAlert(title, body, scrip, link, fetchedAt, env) {
     : "N/A";
   const messageText = `🔔 <b>${escapeTelegramHtml(title)}</b>\n\n${escapeTelegramHtml(body)}\n\n⏱ <b>Fetched:</b> ${formattedFetchTime}\n📎 <a href="${targetLink}">View</a>`;
   try {
-    const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -81,20 +101,18 @@ async function sendTelegramAlert(title, body, scrip, link, fetchedAt, env) {
         disable_web_page_preview: false,
       }),
     });
-    if (!res.ok) {
-      const txt = await res.text().catch(() => "");
-      return { ok: false, status: res.status, error: txt.slice(0, 300) };
-    }
-    return { ok: true };
   } catch (err) {
-    return { ok: false, error: String(err) };
+    console.error("Telegram error:", err);
   }
 }
 
 async function sendNtfyAlert(title, body, scrip, link, fetchedAt, env) {
-  if (!env.NTFY_TOPIC) {
-    return { ok: false, error: "NTFY_TOPIC secret is missing or empty" };
-  }
+  // Trim defensively — a stray trailing newline/space pasted into the
+  // secret (common with `wrangler secret put` on Windows) silently
+  // breaks the request without ever showing an error.
+  const topic = String(env.NTFY_TOPIC || "").trim();
+  if (!topic) return;
+
   var pdfLink = normalizeBseLink(link);
   var targetLink =
     pdfLink && pdfLink !== "https://www.bseindia.com"
@@ -102,30 +120,53 @@ async function sendNtfyAlert(title, body, scrip, link, fetchedAt, env) {
       : scrip
         ? "https://www.bseindia.com/stock-share-price/" + scrip
         : "https://www.bseindia.com";
+
   const formattedFetchTime = fetchedAt
     ? new Date(fetchedAt).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" })
     : "N/A";
 
-  const messageBody = `${body}\nFetched: ${formattedFetchTime}`;
+  // Use ntfy's JSON publish API instead of custom X-* headers.
+  // Header values must be Latin-1/ASCII-safe — a rupee sign, emoji,
+  // or any non-ASCII company/announcement text in X-Title/X-Click
+  // makes fetch() throw "Invalid header value" before the request is
+  // even sent. The JSON body has no such restriction, so this is both
+  // more reliable and lets titles keep their original characters.
+  const payload = {
+    topic,
+    title: String(title || "BSE Alert").slice(0, 200),
+    message: `${body}\n\nFetched: ${formattedFetchTime}`.slice(0, 4000),
+    click: targetLink,
+    tags: ["chart_with_upwards_trend", "warning"],
+    priority: 4,
+  };
 
   try {
-    const res = await fetch(`https://ntfy.sh/${encodeURIComponent(env.NTFY_TOPIC)}`, {
+    const res = await fetch("https://ntfy.sh/", {
       method: "POST",
-      headers: {
-        Title: String(title).slice(0, 250),
-        Click: targetLink,
-        Tags: "chart_with_upwards_trend,warning",
-        Priority: "4",
-      },
-      body: messageBody,
+      headers: { "Content-Type": "application/json; charset=utf-8" },
+      body: JSON.stringify(payload),
     });
+
+    const resText = await res.text().catch(() => "");
+    await saveLastNtfyStatus(env, {
+      ok: res.ok,
+      status: res.status,
+      response: resText.slice(0, 500),
+      topic,
+      at: new Date().toISOString(),
+    });
+
     if (!res.ok) {
-      const txt = await res.text().catch(() => "");
-      return { ok: false, status: res.status, error: txt.slice(0, 300) };
+      console.error("ntfy HTTP error:", res.status, resText);
     }
-    return { ok: true };
   } catch (err) {
-    return { ok: false, error: String(err) };
+    console.error("ntfy error:", err);
+    await saveLastNtfyStatus(env, {
+      ok: false,
+      error: String(err && err.message ? err.message : err),
+      topic,
+      at: new Date().toISOString(),
+    });
   }
 }
 
@@ -189,24 +230,6 @@ function matchesWatchlist(item, watchlist) {
   return false;
 }
 
-function itemToAnnouncement(item, fetchedAt, isAlert) {
-  const company = extractCompanyFromTitle(item.title);
-  const scrip = String(item.scripcode || extractScripFromTitle(item.title) || "").trim();
-  const title = String(item.description || item.title || "New Announcement").trim();
-  const link = normalizeBseLink(item.link);
-
-  return {
-    company,
-    scrip,
-    title,
-    link,
-    fingerprint: computeFingerprint(item),
-    pubDate: parsePubDateRss(item.pubDate),
-    fetchedAt,
-    alert: !!isAlert,
-  };
-}
-
 function parseRssItems(xmlText) {
   const items = [];
   const itemBlocks = xmlText.split(/<item>/i).slice(1);
@@ -216,8 +239,7 @@ function parseRssItems(xmlText) {
     const content = end === -1 ? block : block.slice(0, end);
 
     function tag(name) {
-      const re = new RegExp(`<${name}[^>]*>([\\s\\S]*?)</${name}>`, "i");
-      const m = content.match(re);
+      const m = content.match(TAG_REGEXES[name]);
       if (!m) return "";
       return m[1]
         .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/gi, "$1")
@@ -241,6 +263,29 @@ function parseRssItems(xmlText) {
   return items;
 }
 
+/* ---------- KV helpers ---------- */
+
+// Workers KV allows at most 1 write/sec per key. If two requests try to
+// write the same key within that window, one is rejected. This wraps
+// every KV write with a few retries, backing off past the 1-second
+// window with a little random jitter each time so concurrent retries
+// don't keep landing on top of each other and colliding again.
+async function kvPut(env, key, value, attempts = 3) {
+  let lastErr;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      await env.BSE_XML_RSS_DATA.put(key, value);
+      return;
+    } catch (err) {
+      lastErr = err;
+      if (i < attempts - 1) {
+        await sleep(1050 + Math.floor(Math.random() * 400));
+      }
+    }
+  }
+  throw lastErr;
+}
+
 async function getWatchlist(env) {
   if (!env.BSE_XML_RSS_DATA) return [];
   const data = await env.BSE_XML_RSS_DATA.get("watchlist", "json");
@@ -249,7 +294,7 @@ async function getWatchlist(env) {
 
 async function setWatchlist(env, watchlist) {
   if (!env.BSE_XML_RSS_DATA) throw new Error("BSE_XML_RSS_DATA is not bound.");
-  await env.BSE_XML_RSS_DATA.put("watchlist", JSON.stringify(watchlist));
+  await kvPut(env, "watchlist", JSON.stringify(watchlist));
 }
 
 async function getNotificationSettings(env) {
@@ -260,7 +305,7 @@ async function getNotificationSettings(env) {
 
 async function setNotificationSettings(env, settings) {
   if (!env.BSE_XML_RSS_DATA) throw new Error("BSE_XML_RSS_DATA is not bound.");
-  await env.BSE_XML_RSS_DATA.put("notificationSettings", JSON.stringify(settings));
+  await kvPut(env, "notificationSettings", JSON.stringify(settings));
 }
 
 async function getRecentSeen(env) {
@@ -271,7 +316,7 @@ async function getRecentSeen(env) {
 
 async function saveRecentSeen(env, ids) {
   if (!env.BSE_XML_RSS_DATA) return;
-  await env.BSE_XML_RSS_DATA.put("recentSeen", JSON.stringify(ids.slice(0, MAX_RECENT_SEEN)));
+  await kvPut(env, "recentSeen", JSON.stringify(ids.slice(0, MAX_RECENT_SEEN)));
 }
 
 async function getAlertFingerprints(env) {
@@ -282,7 +327,7 @@ async function getAlertFingerprints(env) {
 
 async function saveAlertFingerprints(env, list) {
   if (!env.BSE_XML_RSS_DATA) return;
-  await env.BSE_XML_RSS_DATA.put("alertFingerprints", JSON.stringify(list.slice(0, MAX_ALERTS * 2)));
+  await kvPut(env, "alertFingerprints", JSON.stringify(list.slice(0, MAX_ALERTS * 2)));
 }
 
 async function getAlerts(env) {
@@ -293,22 +338,20 @@ async function getAlerts(env) {
 
 async function saveAlerts(env, alerts) {
   if (!env.BSE_XML_RSS_DATA) return;
-  await env.BSE_XML_RSS_DATA.put("specialAlerts", JSON.stringify(alerts.slice(0, MAX_ALERTS)));
+  await kvPut(env, "specialAlerts", JSON.stringify(alerts.slice(0, MAX_ALERTS)));
 }
 
-async function getRecentAnnouncements(env) {
-  if (!env.BSE_XML_RSS_DATA) return [];
-  const data = await env.BSE_XML_RSS_DATA.get("recentAnnouncements", "json");
-  return Array.isArray(data) ? data : [];
-}
-
-async function saveRecentAnnouncements(env, list) {
+async function saveLastNtfyStatus(env, status) {
   if (!env.BSE_XML_RSS_DATA) return;
-  await env.BSE_XML_RSS_DATA.put(
-    "recentAnnouncements",
-    JSON.stringify(list.slice(0, MAX_RECENT_ANNOUNCEMENTS))
-  );
+  await kvPut(env, "lastNtfyStatus", JSON.stringify(status));
 }
+
+async function getLastNtfyStatus(env) {
+  if (!env.BSE_XML_RSS_DATA) return null;
+  return await env.BSE_XML_RSS_DATA.get("lastNtfyStatus", "json");
+}
+
+/* ---------- core logic ---------- */
 
 async function fetchRssItems() {
   const response = await fetch(BSE_RSS_URL, {
@@ -328,7 +371,7 @@ async function fetchRssItems() {
   return parseRssItems(xml);
 }
 
-async function pollOnce(env) {
+async function pollOnce(env, cachedWatchlist) {
   const fetchedAt = new Date().toISOString();
   let items = [];
   try {
@@ -350,37 +393,16 @@ async function pollOnce(env) {
     page.push({ item: it, fp });
   }
 
-  const watchlist = await getWatchlist(env);
-  const existing = await getRecentAnnouncements(env);
-  const existingMap = new Map();
-  for (const a of existing) {
-    existingMap.set(a.fingerprint, a);
-  }
-
-  const currentPageItems = page.map(({ item, fp }) => {
-    const isAlert = matchesWatchlist(item, watchlist);
-    const old = existingMap.get(fp);
-    const originalFetchedAt = old && old.fetchedAt ? old.fetchedAt : fetchedAt;
-    return itemToAnnouncement(item, originalFetchedAt, isAlert);
-  });
-
-  const seenFp = new Set(currentPageItems.map((a) => a.fingerprint));
-  const merged = [...currentPageItems];
-  for (const item of existing) {
-    if (merged.length >= MAX_RECENT_ANNOUNCEMENTS) break;
-    if (!seenFp.has(item.fingerprint)) {
-      seenFp.add(item.fingerprint);
-      merged.push(item);
-    }
-  }
-  await saveRecentAnnouncements(env, merged);
-
+  // Cheap "is anything new at all?" check. The only KV writes below
+  // (recentSeen, and alerts when a watchlist item matches) happen
+  // when something has actually changed — most polls end here.
   const recentSeen = await getRecentSeen(env);
   const seenSet = new Set(recentSeen);
 
   if (recentSeen.length === 0) {
-    const fps = page.map((p) => p.fp);
-    await saveRecentSeen(env, fps);
+    // Baseline run (first ever poll, or after a KV reset) — nothing
+    // to alert on yet, just record what we've seen.
+    await saveRecentSeen(env, page.map((p) => p.fp));
     return { ok: true, status: "baseline", newAnnouncements: 0, newAlerts: 0, rows: items.length };
   }
 
@@ -393,6 +415,7 @@ async function pollOnce(env) {
     return { ok: true, newAnnouncements: 0, newAlerts: 0, rows: items.length };
   }
 
+  const watchlist = cachedWatchlist || (await getWatchlist(env));
   const settings = await getNotificationSettings(env);
 
   let newAlertCount = 0;
@@ -416,38 +439,31 @@ async function pollOnce(env) {
       const link = normalizeBseLink(item.link);
       const pubDate = parsePubDateRss(item.pubDate);
 
-      const existingAnn = existingMap.get(fp);
-      const alertFetchedAt = existingAnn && existingAnn.fetchedAt ? existingAnn.fetchedAt : fetchedAt;
-
-      let telegramResult = { ok: false };
-      let ntfyResult = { ok: false };
-
+      // Use the first-seen time (this is a brand-new item, so current fetchedAt is correct)
       if (settings.telegram !== false) {
-        telegramResult = await sendTelegramAlert(`${company} (${scrip})`, title, scrip, link, alertFetchedAt, env);
+        await sendTelegramAlert(`${company} (${scrip})`, title, scrip, link, fetchedAt, env);
       }
       if (settings.ntfy !== false) {
-        ntfyResult = await sendNtfyAlert(`${company} (${scrip})`, title, scrip, link, alertFetchedAt, env);
+        await sendNtfyAlert(`${company} (${scrip})`, title, scrip, link, fetchedAt, env);
       }
 
-      // Record the alert if at least one channel succeeded, or if both channels are disabled
-      if (telegramResult.ok || ntfyResult.ok || (settings.telegram === false && settings.ntfy === false)) {
-        alerts.unshift({
-          company,
-          scrip,
-          title,
-          link,
-          fingerprint: fp,
-          pubDate,
-          fetchedAt: alertFetchedAt,
-          alert: true,
-          alertCreatedAt: new Date().toISOString(),
-        });
-        alertFpSet.add(fp);
-        newAlertCount++;
-      }
+      alerts.unshift({
+        company,
+        scrip,
+        title,
+        link,
+        fingerprint: fp,
+        pubDate,
+        fetchedAt,                 // first time we saw it
+        alert: true,
+        alertCreatedAt: new Date().toISOString(),
+      });
+      alertFpSet.add(fp);
+      newAlertCount++;
     }
   }
 
+  // update recentSeen
   const updatedSeen = [];
   const addSet = new Set();
   for (let i = 0; i < newOnes.length; i++) {
@@ -485,8 +501,13 @@ async function pollBurst(env) {
   let totalNew = 0;
   let totalAlerts = 0;
 
+  // Read once for the whole burst instead of once per poll — the
+  // watchlist rarely changes mid-burst, and this saves redundant
+  // KV reads + JSON.parse calls per cron tick.
+  const watchlist = await getWatchlist(env);
+
   for (let i = 0; i < BURST_POLLS; i++) {
-    const r = await pollOnce(env);
+    const r = await pollOnce(env, watchlist);
     results.push(r);
     totalNew += r.newAnnouncements || 0;
     totalAlerts += r.newAlerts || 0;
@@ -514,8 +535,8 @@ export default {
         return json({
           status: "running",
           app: "BSE XML RSS",
-          version: "1.2",
-          note: "Original fetchedAt is permanent. Alerts only for new watchlist matches. Improved ntfy diagnostics.",
+          version: "1.3",
+          note: "Alerts-only (watchlist matches, last 50). Original fetchedAt is permanent. /announcements + /alerts + /monitor + /ntfy-test + /ntfy-status",
         });
       }
 
@@ -543,17 +564,21 @@ export default {
         }
       }
 
+      // Frontend main feed: only watchlist matches, most recent first,
+      // capped for display (full history still kept via /alerts).
       if (url.pathname === "/announcements") {
-        const items = await getRecentAnnouncements(env);
+        const items = (await getAlerts(env)).slice(0, DISPLAY_LIMIT);
         return json({ ok: true, count: items.length, items });
       }
 
+      // Only watchlist-matched alerts (full retained history, up to MAX_ALERTS)
       if (url.pathname === "/alerts") {
         return json({ ok: true, items: await getAlerts(env) });
       }
 
+      // Legacy alias, kept for backward compatibility — same as /announcements
       if (url.pathname === "/bse-announcements") {
-        const items = await getRecentAnnouncements(env);
+        const items = (await getAlerts(env)).slice(0, DISPLAY_LIMIT);
         return json({ ok: true, count: items.length, items });
       }
 
@@ -562,28 +587,29 @@ export default {
       }
 
       if (url.pathname === "/clear-alert-fingerprints") {
-        await env.BSE_XML_RSS_DATA.put("alertFingerprints", "[]");
+        await kvPut(env, "alertFingerprints", "[]");
         return json({ ok: true, message: "Alert fingerprints cleared. Next new matches will send notifications." });
       }
 
-      // Diagnostic test endpoint – returns detailed status for both channels
-      if (url.pathname === "/test-alert") {
-        const title = "TEST ALERT – BSE XML RSS";
-        const body = "This is a forced test message. If you receive this, Telegram and ntfy are working correctly.";
-        const scrip = "000000";
-        const link = "https://www.bseindia.com";
-        const fetchedAt = new Date().toISOString();
+      // Fires one real ntfy notification right now and reports exactly
+      // what ntfy.sh returned (or the exact error), so a delivery
+      // problem shows up immediately instead of only in worker logs.
+      if (url.pathname === "/ntfy-test") {
+        await sendNtfyAlert(
+          "BSE XML RSS — test alert",
+          "If you see this on your device, ntfy delivery is working.",
+          "TEST",
+          "",
+          new Date().toISOString(),
+          env
+        );
+        return json({ ok: true, result: await getLastNtfyStatus(env) });
+      }
 
-        const telegramResult = await sendTelegramAlert(title, body, scrip, link, fetchedAt, env);
-        const ntfyResult = await sendNtfyAlert(title, body, scrip, link, fetchedAt, env);
-
-        return json({
-          ok: true,
-          telegram: telegramResult,
-          ntfy: ntfyResult,
-          message: "Test completed. Check the detailed status objects above and your Telegram / ntfy apps.",
-          tip: "If ntfy.ok is false and error mentions NTFY_TOPIC, run: wrangler secret put NTFY_TOPIC",
-        });
+      // Shows the outcome of the most recent ntfy send attempt
+      // (triggered by /monitor or the cron), without sending a new one.
+      if (url.pathname === "/ntfy-status") {
+        return json({ ok: true, ntfyTopicConfigured: !!(env.NTFY_TOPIC && env.NTFY_TOPIC.trim()), last: await getLastNtfyStatus(env) });
       }
 
       return json({ error: "Not found" }, 404);
