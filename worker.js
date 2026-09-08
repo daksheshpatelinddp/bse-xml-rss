@@ -18,8 +18,8 @@ const MAX_RECENT_SEEN = 800;
 const MAX_ALERTS = 500;
 const MAX_RECENT_ANNOUNCEMENTS = 150;
 
-const BURST_POLLS = 3;
-const BURST_GAP_MS = 18000;
+const BURST_POLLS = 2;
+const BURST_GAP_MS = 20000;
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
