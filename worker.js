@@ -1,11 +1,15 @@
 /*
- * BSE XML RSS – V1.1 (Fixed)
+ * BSE XML RSS – V1.2 (Telegram-only, CPU-optimized)
  * - Official BSE RSS (XML)
  * - Original fetchedAt is permanent
  * - Alerts only for new watchlist matches
+ * - Notifications: Telegram only (ntfy removed)
+ * - Burst polling now reads/writes KV once per cron invocation instead of
+ *   once per sub-poll, and RSS tag parsing uses precompiled regexes, to
+ *   keep CPU time per invocation low (Workers Free plan caps this at 10ms).
  *
  * KV binding: BSE_XML_RSS_DATA
- * Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, NTFY_TOPIC
+ * Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
  */
 
 const BSE_RSS_URL = "https://www.bseindia.com/data/xml/announcements.xml";
@@ -81,35 +85,6 @@ async function sendTelegramAlert(title, body, scrip, link, fetchedAt, env) {
     return res.ok;
   } catch (err) {
     console.error("Telegram error:", err);
-    return false;
-  }
-}
-
-async function sendNtfyAlert(title, body, scrip, link, fetchedAt, env) {
-  if (!env.NTFY_TOPIC) return false;
-  var pdfLink = normalizeBseLink(link);
-  var targetLink =
-    pdfLink && pdfLink !== "https://www.bseindia.com"
-      ? pdfLink
-      : scrip
-        ? "https://www.bseindia.com/stock-share-price/" + scrip
-        : "https://www.bseindia.com";
-  const formattedFetchTime = fetchedAt
-    ? new Date(fetchedAt).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" })
-    : "N/A";
-  try {
-    const res = await fetch(`https://ntfy.sh/${env.NTFY_TOPIC}`, {
-      method: "POST",
-      headers: {
-        Title: title,
-        Click: targetLink,
-        Tags: "chart_with_upwards_trend,warning",
-      },
-      body: `${body}\nFetched: ${formattedFetchTime}`,
-    });
-    return res.ok;
-  } catch (err) {
-    console.error("ntfy error:", err);
     return false;
   }
 }
@@ -191,6 +166,32 @@ function itemToAnnouncement(item, fetchedAt, isAlert) {
   };
 }
 
+// Precompiled once at module load. Building a new RegExp per tag per item
+// (as the previous version did) recompiles the pattern on every call, which
+// is the main reason a single burst poll (3x over ~150 items x 5 tags) could
+// blow past the Workers Free plan's 10ms CPU budget for one invocation.
+const TAG_REGEXES = {
+  title: /<title[^>]*>([\s\S]*?)<\/title>/i,
+  link: /<link[^>]*>([\s\S]*?)<\/link>/i,
+  description: /<description[^>]*>([\s\S]*?)<\/description>/i,
+  pubDate: /<pubDate[^>]*>([\s\S]*?)<\/pubDate>/i,
+  scripcode: /<scripcode[^>]*>([\s\S]*?)<\/scripcode>/i,
+};
+const CDATA_RE = /<!\[CDATA\[([\s\S]*?)\]\]>/gi;
+
+function extractTag(content, name) {
+  const m = content.match(TAG_REGEXES[name]);
+  if (!m) return "";
+  return m[1]
+    .replace(CDATA_RE, "$1")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .trim();
+}
+
 function parseRssItems(xmlText) {
   const items = [];
   const itemBlocks = xmlText.split(/<item>/i).slice(1);
@@ -199,25 +200,11 @@ function parseRssItems(xmlText) {
     const end = block.indexOf("</item>");
     const content = end === -1 ? block : block.slice(0, end);
 
-    function tag(name) {
-      const re = new RegExp(`<${name}[^>]*>([\\s\\S]*?)</${name}>`, "i");
-      const m = content.match(re);
-      if (!m) return "";
-      return m[1]
-        .replace(/<!\[CDATA\[([\s\S]*?)\]\]>/gi, "$1")
-        .replace(/&amp;/g, "&")
-        .replace(/&lt;/g, "<")
-        .replace(/&gt;/g, ">")
-        .replace(/&quot;/g, '"')
-        .replace(/&#39;/g, "'")
-        .trim();
-    }
-
-    const title = tag("title");
-    const link = tag("link");
-    const description = tag("description");
-    const pubDate = tag("pubDate");
-    const scripcode = tag("scripcode");
+    const title = extractTag(content, "title");
+    const link = extractTag(content, "link");
+    const description = extractTag(content, "description");
+    const pubDate = extractTag(content, "pubDate");
+    const scripcode = extractTag(content, "scripcode");
 
     if (!title && !description) continue;
     items.push({ title, link, description, pubDate, scripcode });
@@ -237,9 +224,9 @@ async function setWatchlist(env, watchlist) {
 }
 
 async function getNotificationSettings(env) {
-  if (!env.BSE_XML_RSS_DATA) return { telegram: true, ntfy: true };
+  if (!env.BSE_XML_RSS_DATA) return { telegram: true };
   const data = await env.BSE_XML_RSS_DATA.get("notificationSettings", "json");
-  return data || { telegram: true, ntfy: true };
+  return data || { telegram: true };
 }
 
 async function setNotificationSettings(env, settings) {
@@ -404,16 +391,12 @@ async function pollOnce(env) {
       const alertFetchedAt = existingAnn && existingAnn.fetchedAt ? existingAnn.fetchedAt : fetchedAt;
 
       let telegramOk = false;
-      let ntfyOk = false;
 
       if (settings.telegram !== false) {
         telegramOk = await sendTelegramAlert(`${company} (${scrip})`, title, scrip, link, alertFetchedAt, env);
       }
-      if (settings.ntfy !== false) {
-        ntfyOk = await sendNtfyAlert(`${company} (${scrip})`, title, scrip, link, alertFetchedAt, env);
-      }
 
-      if (telegramOk || ntfyOk || (settings.telegram === false && settings.ntfy === false)) {
+      if (telegramOk || settings.telegram === false) {
         alerts.unshift({
           company,
           scrip,
@@ -463,17 +446,165 @@ async function pollOnce(env) {
   };
 }
 
+// Scheduled (cron) entry point. Re-fetches the RSS feed BURST_POLLS times
+// with a gap between each (to catch announcements published mid-burst), but
+// loads/merges/saves KV state exactly once for the whole burst, instead of
+// once per sub-poll. The 3x repeated KV get/JSON.parse + JSON.stringify/put
+// of recentAnnouncements/recentSeen/alerts was the main source of CPU time
+// in a single scheduled invocation, and is what pushed it over the Workers
+// Free plan's 10ms-per-invocation CPU cap.
 async function pollBurst(env) {
-  const results = [];
+  const watchlist = await getWatchlist(env);
+  const settings = await getNotificationSettings(env);
+  const existing = await getRecentAnnouncements(env);
+  const existingMap = new Map();
+  for (const a of existing) existingMap.set(a.fingerprint, a);
+
+  let recentSeen = await getRecentSeen(env);
+  let seenSet = new Set(recentSeen);
+  const isBaseline = recentSeen.length === 0;
+
+  let alertFpSet = null;
+  let alerts = null;
+
   let totalNew = 0;
   let totalAlerts = 0;
+  let totalRows = 0;
+  let lastPage = null;
+  const results = [];
 
   for (let i = 0; i < BURST_POLLS; i++) {
-    const r = await pollOnce(env);
-    results.push(r);
-    totalNew += r.newAnnouncements || 0;
-    totalAlerts += r.newAlerts || 0;
+    const fetchedAt = new Date().toISOString();
+    let items = [];
+    try {
+      items = await fetchRssItems();
+    } catch (err) {
+      console.error("fetch failed:", err);
+      results.push({ ok: false, error: String(err) });
+      if (i < BURST_POLLS - 1) await sleep(BURST_GAP_MS);
+      continue;
+    }
+
+    const page = [];
+    for (let j = 0; j < items.length; j++) {
+      const fp = computeFingerprint(items[j]);
+      if (!fp) continue;
+      page.push({ item: items[j], fp });
+    }
+    lastPage = { page, fetchedAt };
+    totalRows += items.length;
+
+    if (isBaseline && i === 0) {
+      // First-ever run: record the current feed as the seen baseline, no alerts.
+      recentSeen = page.map((p) => p.fp);
+      seenSet = new Set(recentSeen);
+      results.push({ ok: true, status: "baseline", rows: items.length });
+      if (i < BURST_POLLS - 1) await sleep(BURST_GAP_MS);
+      continue;
+    }
+
+    const newOnes = page.filter((p) => !seenSet.has(p.fp));
+    let newAlertCount = 0;
+
+    if (newOnes.length && watchlist.length > 0) {
+      for (let k = 0; k < newOnes.length; k++) {
+        const { item, fp } = newOnes[k];
+        if (!matchesWatchlist(item, watchlist)) continue;
+
+        if (!alertFpSet) {
+          alertFpSet = new Set(await getAlertFingerprints(env));
+          alerts = await getAlerts(env);
+        }
+        if (alertFpSet.has(fp)) continue;
+
+        const company = extractCompanyFromTitle(item.title);
+        const scrip = String(item.scripcode || extractScripFromTitle(item.title) || "").trim();
+        const title = String(item.description || item.title || "New Announcement").trim();
+        const link = normalizeBseLink(item.link);
+        const pubDate = parsePubDateRss(item.pubDate);
+        const existingAnn = existingMap.get(fp);
+        const alertFetchedAt = existingAnn && existingAnn.fetchedAt ? existingAnn.fetchedAt : fetchedAt;
+
+        let telegramOk = false;
+        if (settings.telegram !== false) {
+          telegramOk = await sendTelegramAlert(`${company} (${scrip})`, title, scrip, link, alertFetchedAt, env);
+        }
+
+        if (telegramOk || settings.telegram === false) {
+          alerts.unshift({
+            company,
+            scrip,
+            title,
+            link,
+            fingerprint: fp,
+            pubDate,
+            fetchedAt: alertFetchedAt,
+            alert: true,
+            alertCreatedAt: new Date().toISOString(),
+          });
+          alertFpSet.add(fp);
+          newAlertCount++;
+        }
+      }
+    }
+
+    // Update in-memory seen state so the next sub-poll in this burst
+    // doesn't re-treat the same items as new (mirrors what a KV round-trip
+    // would have done, without the extra read/write).
+    if (newOnes.length) {
+      const addSet = new Set();
+      const updatedSeen = [];
+      for (const { fp } of newOnes) {
+        if (!addSet.has(fp)) {
+          addSet.add(fp);
+          updatedSeen.push(fp);
+        }
+      }
+      for (const fp of recentSeen) {
+        if (updatedSeen.length >= MAX_RECENT_SEEN) break;
+        if (!addSet.has(fp)) {
+          addSet.add(fp);
+          updatedSeen.push(fp);
+        }
+      }
+      recentSeen = updatedSeen;
+      seenSet = new Set(recentSeen);
+    }
+
+    totalNew += newOnes.length;
+    totalAlerts += newAlertCount;
+    results.push({ ok: true, newAnnouncements: newOnes.length, newAlerts: newAlertCount, rows: items.length });
+
     if (i < BURST_POLLS - 1) await sleep(BURST_GAP_MS);
+  }
+
+  // Persist everything exactly once, using the final poll's feed snapshot
+  // (the BSE feed is cumulative, so the last poll already contains
+  // everything the earlier polls in this burst saw).
+  if (lastPage) {
+    const currentPageItems = lastPage.page.map(({ item, fp }) => {
+      const isAlert = matchesWatchlist(item, watchlist);
+      const old = existingMap.get(fp);
+      const originalFetchedAt = old && old.fetchedAt ? old.fetchedAt : lastPage.fetchedAt;
+      return itemToAnnouncement(item, originalFetchedAt, isAlert);
+    });
+    const seenFp = new Set(currentPageItems.map((a) => a.fingerprint));
+    const merged = [...currentPageItems];
+    for (const item of existing) {
+      if (merged.length >= MAX_RECENT_ANNOUNCEMENTS) break;
+      if (!seenFp.has(item.fingerprint)) {
+        seenFp.add(item.fingerprint);
+        merged.push(item);
+      }
+    }
+    await saveRecentAnnouncements(env, merged);
+  }
+
+  await saveRecentSeen(env, recentSeen);
+
+  if (totalAlerts > 0 && alerts && alertFpSet) {
+    await saveAlerts(env, alerts);
+    await saveAlertFingerprints(env, Array.from(alertFpSet));
   }
 
   return {
@@ -483,6 +614,7 @@ async function pollBurst(env) {
     gapMs: BURST_GAP_MS,
     newAnnouncements: totalNew,
     newAlerts: totalAlerts,
+    rows: totalRows,
     results,
   };
 }
@@ -549,22 +681,20 @@ export default {
   return json({ ok: true, message: "Alert fingerprints cleared. Next new matches will send notifications." });
 }
 
-// Temporary force test – sends one Telegram + ntfy message
+// Temporary force test – sends one Telegram message
 if (url.pathname === "/test-alert") {
   const title = "TEST ALERT – BSE XML RSS";
-  const body = "This is a forced test message. If you receive this, Telegram and ntfy are working correctly.";
+  const body = "This is a forced test message. If you receive this, Telegram is working correctly.";
   const scrip = "000000";
   const link = "https://www.bseindia.com";
   const fetchedAt = new Date().toISOString();
 
   const telegramOk = await sendTelegramAlert(title, body, scrip, link, fetchedAt, env);
-  const ntfyOk = await sendNtfyAlert(title, body, scrip, link, fetchedAt, env);
 
   return json({
     ok: true,
     telegram: telegramOk,
-    ntfy: ntfyOk,
-    message: "Test alert sent. Check Telegram and ntfy."
+    message: "Test alert sent. Check Telegram."
   });
 }
 
