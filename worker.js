@@ -368,8 +368,8 @@ async function pollOnce(env) {
   }
 
   const currentPageItems = page.map(({ item, fp }) => {
-    const isAlert = matchesWatchlist(item, watchlist);
     const old = existingMap.get(fp);
+    const isAlert = old ? !!old.alert : matchesWatchlist(item, watchlist);
     const originalFetchedAt = old && old.fetchedAt ? old.fetchedAt : fetchedAt;
     return itemToAnnouncement(item, originalFetchedAt, isAlert);
   });
@@ -622,8 +622,8 @@ async function pollBurst(env) {
   // everything the earlier polls in this burst saw).
   if (lastPage) {
     const currentPageItems = lastPage.page.map(({ item, fp }) => {
-      const isAlert = matchesWatchlist(item, watchlist);
       const old = existingMap.get(fp);
+      const isAlert = old ? !!old.alert : matchesWatchlist(item, watchlist);
       const originalFetchedAt = old && old.fetchedAt ? old.fetchedAt : lastPage.fetchedAt;
       return itemToAnnouncement(item, originalFetchedAt, isAlert);
     });
