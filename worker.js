@@ -192,9 +192,19 @@ function extractTag(content, name) {
     .trim();
 }
 
+// Only the top of the feed can contain genuinely new items (BSE's RSS is
+// newest-first, and the rest of this file already assumes that ordering).
+// During active trading hours the live feed can carry many hundreds of
+// entries; fully parsing all of them (5 regex extractions + a fingerprint
+// each) on every sub-poll is what pushes a single invocation past the
+// Workers Free plan's 10ms CPU cap. Capping this is safe: it is extremely
+// unlikely BSE publishes more than this many brand-new filings inside one
+// polling interval.
+const MAX_ITEMS_PER_POLL = 120;
+
 function parseRssItems(xmlText) {
   const items = [];
-  const itemBlocks = xmlText.split(/<item>/i).slice(1);
+  const itemBlocks = xmlText.split(/<item>/i).slice(1, 1 + MAX_ITEMS_PER_POLL);
 
   for (const block of itemBlocks) {
     const end = block.indexOf("</item>");
