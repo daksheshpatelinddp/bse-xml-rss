@@ -202,9 +202,38 @@ function extractTag(content, name) {
 // polling interval.
 const MAX_ITEMS_PER_POLL = 120;
 
+// Finds only the byte range covering the newest MAX_ITEMS_PER_POLL <item>
+// blocks and returns that as a substring, WITHOUT scanning the rest of the
+// document. This matters because xmlText.split(/<item>/i) always scans the
+// entire input first and only discards the extra pieces afterward — so
+// capping "items kept" alone doesn't cap "text scanned". BSE's feed is
+// cumulative for the whole trading day, so the raw text keeps growing
+// hour by hour; this keeps per-poll cost tied to MAX_ITEMS_PER_POLL, not to
+// how much the feed has grown by that point in the day.
+const ITEM_OPEN_RE = /<item>/gi;
+
+function boundedItemsXml(xmlText, maxItems) {
+  ITEM_OPEN_RE.lastIndex = 0;
+  let firstStart = -1;
+  let lastStart = -1;
+  let count = 0;
+  let m;
+  while ((m = ITEM_OPEN_RE.exec(xmlText)) !== null) {
+    if (firstStart === -1) firstStart = m.index;
+    lastStart = m.index;
+    count++;
+    if (count >= maxItems) break;
+  }
+  if (firstStart === -1) return "";
+  const closeIdx = xmlText.indexOf("</item>", lastStart);
+  const endIdx = closeIdx === -1 ? xmlText.length : closeIdx + "</item>".length;
+  return xmlText.slice(firstStart, endIdx);
+}
+
 function parseRssItems(xmlText) {
   const items = [];
-  const itemBlocks = xmlText.split(/<item>/i).slice(1, 1 + MAX_ITEMS_PER_POLL);
+  const bounded = boundedItemsXml(xmlText, MAX_ITEMS_PER_POLL);
+  const itemBlocks = bounded.split(/<item>/i).slice(1);
 
   for (const block of itemBlocks) {
     const end = block.indexOf("</item>");
