@@ -14,8 +14,8 @@ const MAX_RECENT_SEEN = 800;
 const MAX_ALERTS = 500;       // How many watchlist matches to retain in KV history
 const DISPLAY_LIMIT = 50;     // How many of those the frontend feed shows
 
-const BURST_POLLS = 2;
-const BURST_GAP_MS = 25000;
+const BURST_POLLS = 1;
+const BURST_GAP_MS = 0;
 const MAX_ITEMS_PER_POLL = 50;
 
 const CORS_HEADERS = {
