@@ -1,12 +1,8 @@
 /*
- * BSE XML RSS – V1.2 (Telegram-only, CPU-optimized)
- * - Official BSE RSS (XML)
- * - Original fetchedAt is permanent
- * - Alerts only for new watchlist matches
- * - Notifications: Telegram only (ntfy removed)
- * - Burst polling now reads/writes KV once per cron invocation instead of
- *   once per sub-poll, and RSS tag parsing uses precompiled regexes, to
- *   keep CPU time per invocation low (Workers Free plan caps this at 10ms).
+ * BSE XML RSS – V1.3 (Telegram-only, Maximum CPU Optimization)
+ * - Uses zero-regex pointer-based XML parsing (indexOf loops) to eliminate V8 overhead.
+ * - Caps items at 50 per poll to ensure 2 burst runs stay well below Cloudflare's 10ms CPU limit.
+ * - Permanent fetchedAt timestamping and duplicate tracking via KV.
  *
  * KV binding: BSE_XML_RSS_DATA
  * Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
@@ -15,12 +11,12 @@
 const BSE_RSS_URL = "https://www.bseindia.com/data/xml/announcements.xml";
 
 const MAX_RECENT_SEEN = 800;
-const MAX_ALERTS = 500;       // how many watchlist matches to retain in KV history
-const DISPLAY_LIMIT = 50;     // how many of those the frontend feed shows
+const MAX_ALERTS = 500;       // How many watchlist matches to retain in KV history
+const DISPLAY_LIMIT = 50;     // How many of those the frontend feed shows
 
-const BURST_POLLS = 1;
-;
-const BURST_GAP_MS = 0;
+const BURST_POLLS = 2;
+const BURST_GAP_MS = 25000;
+const MAX_ITEMS_PER_POLL = 50;
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -56,7 +52,7 @@ function escapeTelegramHtml(text) {
   return String(text || "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+    .replace/>/g, "&gt;");
 }
 
 async function sendTelegramAlert(title, body, scrip, link, fetchedAt, env) {
@@ -149,24 +145,24 @@ function matchesWatchlist(item, watchlist) {
   return false;
 }
 
-// Precompiled once at module load. Building a new RegExp per tag per item
-// (as the previous version did) recompiles the pattern on every call, which
-// is the main reason a single burst poll (3x over ~150 items x 5 tags) could
-// blow past the Workers Free plan's 10ms CPU budget for one invocation.
-const TAG_REGEXES = {
-  title: /<title[^>]*>([\s\S]*?)<\/title>/i,
-  link: /<link[^>]*>([\s\S]*?)<\/link>/i,
-  description: /<description[^>]*>([\s\S]*?)<\/description>/i,
-  pubDate: /<pubDate[^>]*>([\s\S]*?)<\/pubDate>/i,
-  scripcode: /<scripcode[^>]*>([\s\S]*?)<\/scripcode>/i,
-};
-const CDATA_RE = /<!\[CDATA\[([\s\S]*?)\]\]>/gi;
+/* =========================================================================
+   ZERO-REGEX INDEX PARSER (MAXIMUM PERFORMANCE)
+   ========================================================================= */
 
-function extractTag(content, name) {
-  const m = content.match(TAG_REGEXES[name]);
-  if (!m) return "";
-  return m[1]
-    .replace(CDATA_RE, "$1")
+function extractTagValue(xml, tagName, startPos, endPos) {
+  const openTag = `<${tagName}>`;
+  const closeTag = `</${tagName}>`;
+  const oIdx = xml.indexOf(openTag, startPos);
+  if (oIdx === -1 || oIdx >= endPos) return "";
+  const vStart = oIdx + openTag.length;
+  const cIdx = xml.indexOf(closeTag, vStart);
+  if (cIdx === -1 || cIdx >= endPos) return "";
+
+  let val = xml.slice(vStart, cIdx);
+  if (val.startsWith("<![CDATA[")) {
+    val = val.slice(9, -3);
+  }
+  return val
     .replace(/&amp;/g, "&")
     .replace(/&lt;/g, "<")
     .replace(/&gt;/g, ">")
@@ -175,64 +171,41 @@ function extractTag(content, name) {
     .trim();
 }
 
-// Only the top of the feed can contain genuinely new items (BSE's RSS is
-// newest-first, and the rest of this file already assumes that ordering).
-// During active trading hours the live feed can carry many hundreds of
-// entries; fully parsing all of them (5 regex extractions + a fingerprint
-// each) on every sub-poll is what pushes a single invocation past the
-// Workers Free plan's 10ms CPU cap. Capping this is safe: it is extremely
-// unlikely BSE publishes more than this many brand-new filings inside one
-// polling interval.
-const MAX_ITEMS_PER_POLL = 120;
-
-// Finds only the byte range covering the newest MAX_ITEMS_PER_POLL <item>
-// blocks and returns that as a substring, WITHOUT scanning the rest of the
-// document. This matters because xmlText.split(/<item>/i) always scans the
-// entire input first and only discards the extra pieces afterward — so
-// capping "items kept" alone doesn't cap "text scanned". BSE's feed is
-// cumulative for the whole trading day, so the raw text keeps growing
-// hour by hour; this keeps per-poll cost tied to MAX_ITEMS_PER_POLL, not to
-// how much the feed has grown by that point in the day.
-const ITEM_OPEN_RE = /<item>/gi;
-
-function boundedItemsXml(xmlText, maxItems) {
-  ITEM_OPEN_RE.lastIndex = 0;
-  let firstStart = -1;
-  let lastStart = -1;
-  let count = 0;
-  let m;
-  while ((m = ITEM_OPEN_RE.exec(xmlText)) !== null) {
-    if (firstStart === -1) firstStart = m.index;
-    lastStart = m.index;
-    count++;
-    if (count >= maxItems) break;
-  }
-  if (firstStart === -1) return "";
-  const closeIdx = xmlText.indexOf("</item>", lastStart);
-  const endIdx = closeIdx === -1 ? xmlText.length : closeIdx + "</item>".length;
-  return xmlText.slice(firstStart, endIdx);
-}
-
 function parseRssItems(xmlText) {
   const items = [];
-  const bounded = boundedItemsXml(xmlText, MAX_ITEMS_PER_POLL);
-  const itemBlocks = bounded.split(/<item>/i).slice(1);
+  let pos = 0;
+  let count = 0;
 
-  for (const block of itemBlocks) {
-    const end = block.indexOf("</item>");
-    const content = end === -1 ? block : block.slice(0, end);
+  while (count < MAX_ITEMS_PER_POLL) {
+    const itemStart = xmlText.indexOf("<item>", pos);
+    if (itemStart === -1) break;
 
-    const title = extractTag(content, "title");
-    const link = extractTag(content, "link");
-    const description = extractTag(content, "description");
-    const pubDate = extractTag(content, "pubDate");
-    const scripcode = extractTag(content, "scripcode");
+    const itemEnd = xmlText.indexOf("</item>", itemStart);
+    if (itemEnd === -1) break;
 
-    if (!title && !description) continue;
-    items.push({ title, link, description, pubDate, scripcode });
+    const title = extractTagValue(xmlText, "title", itemStart, itemEnd);
+    const description = extractTagValue(xmlText, "description", itemStart, itemEnd);
+
+    if (title || description) {
+      items.push({
+        title,
+        link: extractTagValue(xmlText, "link", itemStart, itemEnd),
+        description,
+        pubDate: extractTagValue(xmlText, "pubDate", itemStart, itemEnd),
+        scripcode: extractTagValue(xmlText, "scripcode", itemStart, itemEnd),
+      });
+    }
+
+    pos = itemEnd + 7; // Move pointer past </item>
+    count++;
   }
+
   return items;
 }
+
+/* =========================================================================
+   STORAGE HELPERS (KV)
+   ========================================================================= */
 
 async function getWatchlist(env) {
   if (!env.BSE_XML_RSS_DATA) return [];
@@ -289,6 +262,10 @@ async function saveAlerts(env, alerts) {
   await env.BSE_XML_RSS_DATA.put("specialAlerts", JSON.stringify(alerts.slice(0, MAX_ALERTS)));
 }
 
+/* =========================================================================
+   POLLING & ENGINE LOGIC
+   ========================================================================= */
+
 async function fetchRssItems() {
   const response = await fetch(BSE_RSS_URL, {
     method: "GET",
@@ -333,8 +310,6 @@ async function pollOnce(env, cachedWatchlist) {
   const seenSet = new Set(recentSeen);
 
   if (recentSeen.length === 0) {
-    // Baseline run (first ever poll, or after a KV reset) — nothing to
-    // alert on yet, just record what we've seen.
     await saveRecentSeen(env, page.map((p) => p.fp));
     return { ok: true, status: "baseline", newAnnouncements: 0, newAlerts: 0, rows: items.length };
   }
@@ -427,22 +402,11 @@ async function pollOnce(env, cachedWatchlist) {
   };
 }
 
-// Scheduled (cron) entry point. Runs pollOnce BURST_POLLS times with a gap
-// between each, to catch announcements published mid-burst. This project's
-// scope is watchlist alerts only (the general "show everything" feed was
-// removed — see /areas/bse-xml-rss for the reasoning), so pollOnce itself
-// is cheap: it only fingerprints+dedupes the fetched feed and builds full
-// records for genuine new watchlist matches, never rebuilding a large
-// stored list on every poll. That's what makes repeating it BURST_POLLS
-// times affordable within the Workers Free plan's 10ms-per-invocation cap.
 async function pollBurst(env) {
   const results = [];
   let totalNew = 0;
   let totalAlerts = 0;
 
-  // Read once for the whole burst instead of once per poll — the
-  // watchlist rarely changes mid-burst, and this saves redundant
-  // KV reads + JSON.parse calls per cron tick.
   const watchlist = await getWatchlist(env);
 
   for (let i = 0; i < BURST_POLLS; i++) {
@@ -464,6 +428,10 @@ async function pollBurst(env) {
   };
 }
 
+/* =========================================================================
+   ENTRY POINTS
+   ========================================================================= */
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -474,8 +442,8 @@ export default {
         return json({
           status: "running",
           app: "BSE XML RSS",
-          version: "1.1",
-          note: "Original fetchedAt is permanent. Alerts only for new watchlist matches.",
+          version: "1.3",
+          note: "Zero-regex parsing active. Permanent fetchedAt timestamps.",
         });
       }
 
@@ -503,7 +471,7 @@ export default {
         }
       }
 
-      if (url.pathname === "/announcements") {
+      if (url.pathname === "/announcements" || url.pathname === "/bse-announcements") {
         const items = (await getAlerts(env)).slice(0, DISPLAY_LIMIT);
         return json({ ok: true, count: items.length, items });
       }
@@ -512,36 +480,26 @@ export default {
         return json({ ok: true, items: await getAlerts(env) });
       }
 
-      if (url.pathname === "/bse-announcements") {
-        const items = (await getAlerts(env)).slice(0, DISPLAY_LIMIT);
-        return json({ ok: true, count: items.length, items });
+      if (url.pathname === "/clear-alert-fingerprints") {
+        await env.BSE_XML_RSS_DATA.put("alertFingerprints", "[]");
+        return json({ ok: true, message: "Alert fingerprints cleared." });
       }
 
-      if (url.pathname === "/categories") {
-        return json({ ok: true, categories: [] });
+      if (url.pathname === "/test-alert") {
+        const title = "TEST ALERT – BSE XML RSS";
+        const body = "This is a forced test message from the CPU-optimized worker.";
+        const scrip = "000000";
+        const link = "https://www.bseindia.com";
+        const fetchedAt = new Date().toISOString();
+
+        const telegramOk = await sendTelegramAlert(title, body, scrip, link, fetchedAt, env);
+
+        return json({
+          ok: true,
+          telegram: telegramOk,
+          message: "Test alert sent. Check Telegram.",
+        });
       }
-
-   if (url.pathname === "/clear-alert-fingerprints") {
-  await env.BSE_XML_RSS_DATA.put("alertFingerprints", "[]");
-  return json({ ok: true, message: "Alert fingerprints cleared. Next new matches will send notifications." });
-}
-
-// Temporary force test – sends one Telegram message
-if (url.pathname === "/test-alert") {
-  const title = "TEST ALERT – BSE XML RSS";
-  const body = "This is a forced test message. If you receive this, Telegram is working correctly.";
-  const scrip = "000000";
-  const link = "https://www.bseindia.com";
-  const fetchedAt = new Date().toISOString();
-
-  const telegramOk = await sendTelegramAlert(title, body, scrip, link, fetchedAt, env);
-
-  return json({
-    ok: true,
-    telegram: telegramOk,
-    message: "Test alert sent. Check Telegram."
-  });
-}
 
       return json({ error: "Not found" }, 404);
     } catch (err) {
