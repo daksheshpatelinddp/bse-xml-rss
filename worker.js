@@ -15,11 +15,11 @@
 const BSE_RSS_URL = "https://www.bseindia.com/data/xml/announcements.xml";
 
 const MAX_RECENT_SEEN = 800;
-const MAX_ALERTS = 500;
-const MAX_RECENT_ANNOUNCEMENTS = 150;
+const MAX_ALERTS = 500;       // how many watchlist matches to retain in KV history
+const DISPLAY_LIMIT = 50;     // how many of those the frontend feed shows
 
-const BURST_POLLS = 2;
-const BURST_GAP_MS = 20000;
+const BURST_POLLS = 4;
+const BURST_GAP_MS = 14000;
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -146,24 +146,6 @@ function matchesWatchlist(item, watchlist) {
     if (wn.length >= 3 && itemCompany && itemCompany.indexOf(wn) !== -1) return true;
   }
   return false;
-}
-
-function itemToAnnouncement(item, fetchedAt, isAlert) {
-  const company = extractCompanyFromTitle(item.title);
-  const scrip = String(item.scripcode || extractScripFromTitle(item.title) || "").trim();
-  const title = String(item.description || item.title || "New Announcement").trim();
-  const link = normalizeBseLink(item.link);
-
-  return {
-    company,
-    scrip,
-    title,
-    link,
-    fingerprint: computeFingerprint(item),
-    pubDate: parsePubDateRss(item.pubDate),
-    fetchedAt,
-    alert: !!isAlert,
-  };
 }
 
 // Precompiled once at module load. Building a new RegExp per tag per item
@@ -306,20 +288,6 @@ async function saveAlerts(env, alerts) {
   await env.BSE_XML_RSS_DATA.put("specialAlerts", JSON.stringify(alerts.slice(0, MAX_ALERTS)));
 }
 
-async function getRecentAnnouncements(env) {
-  if (!env.BSE_XML_RSS_DATA) return [];
-  const data = await env.BSE_XML_RSS_DATA.get("recentAnnouncements", "json");
-  return Array.isArray(data) ? data : [];
-}
-
-async function saveRecentAnnouncements(env, list) {
-  if (!env.BSE_XML_RSS_DATA) return;
-  await env.BSE_XML_RSS_DATA.put(
-    "recentAnnouncements",
-    JSON.stringify(list.slice(0, MAX_RECENT_ANNOUNCEMENTS))
-  );
-}
-
 async function fetchRssItems() {
   const response = await fetch(BSE_RSS_URL, {
     method: "GET",
@@ -338,7 +306,7 @@ async function fetchRssItems() {
   return parseRssItems(xml);
 }
 
-async function pollOnce(env) {
+async function pollOnce(env, cachedWatchlist) {
   const fetchedAt = new Date().toISOString();
   let items = [];
   try {
@@ -360,37 +328,13 @@ async function pollOnce(env) {
     page.push({ item: it, fp });
   }
 
-  const watchlist = await getWatchlist(env);
-  const existing = await getRecentAnnouncements(env);
-  const existingMap = new Map();
-  for (const a of existing) {
-    existingMap.set(a.fingerprint, a);
-  }
-
-  const currentPageItems = page.map(({ item, fp }) => {
-    const old = existingMap.get(fp);
-    const isAlert = old ? !!old.alert : matchesWatchlist(item, watchlist);
-    const originalFetchedAt = old && old.fetchedAt ? old.fetchedAt : fetchedAt;
-    return itemToAnnouncement(item, originalFetchedAt, isAlert);
-  });
-
-  const seenFp = new Set(currentPageItems.map((a) => a.fingerprint));
-  const merged = [...currentPageItems];
-  for (const item of existing) {
-    if (merged.length >= MAX_RECENT_ANNOUNCEMENTS) break;
-    if (!seenFp.has(item.fingerprint)) {
-      seenFp.add(item.fingerprint);
-      merged.push(item);
-    }
-  }
-  await saveRecentAnnouncements(env, merged);
-
   const recentSeen = await getRecentSeen(env);
   const seenSet = new Set(recentSeen);
 
   if (recentSeen.length === 0) {
-    const fps = page.map((p) => p.fp);
-    await saveRecentSeen(env, fps);
+    // Baseline run (first ever poll, or after a KV reset) — nothing to
+    // alert on yet, just record what we've seen.
+    await saveRecentSeen(env, page.map((p) => p.fp));
     return { ok: true, status: "baseline", newAnnouncements: 0, newAlerts: 0, rows: items.length };
   }
 
@@ -403,6 +347,7 @@ async function pollOnce(env) {
     return { ok: true, newAnnouncements: 0, newAlerts: 0, rows: items.length };
   }
 
+  const watchlist = cachedWatchlist || (await getWatchlist(env));
   const settings = await getNotificationSettings(env);
 
   let newAlertCount = 0;
@@ -426,13 +371,9 @@ async function pollOnce(env) {
       const link = normalizeBseLink(item.link);
       const pubDate = parsePubDateRss(item.pubDate);
 
-      const existingAnn = existingMap.get(fp);
-      const alertFetchedAt = existingAnn && existingAnn.fetchedAt ? existingAnn.fetchedAt : fetchedAt;
-
       let telegramOk = false;
-
       if (settings.telegram !== false) {
-        telegramOk = await sendTelegramAlert(`${company} (${scrip})`, title, scrip, link, alertFetchedAt, env);
+        telegramOk = await sendTelegramAlert(`${company} (${scrip})`, title, scrip, link, fetchedAt, env);
       }
 
       if (telegramOk || settings.telegram === false) {
@@ -443,7 +384,7 @@ async function pollOnce(env) {
           link,
           fingerprint: fp,
           pubDate,
-          fetchedAt: alertFetchedAt,
+          fetchedAt,
           alert: true,
           alertCreatedAt: new Date().toISOString(),
         });
@@ -485,165 +426,30 @@ async function pollOnce(env) {
   };
 }
 
-// Scheduled (cron) entry point. Re-fetches the RSS feed BURST_POLLS times
-// with a gap between each (to catch announcements published mid-burst), but
-// loads/merges/saves KV state exactly once for the whole burst, instead of
-// once per sub-poll. The 3x repeated KV get/JSON.parse + JSON.stringify/put
-// of recentAnnouncements/recentSeen/alerts was the main source of CPU time
-// in a single scheduled invocation, and is what pushed it over the Workers
-// Free plan's 10ms-per-invocation CPU cap.
+// Scheduled (cron) entry point. Runs pollOnce BURST_POLLS times with a gap
+// between each, to catch announcements published mid-burst. This project's
+// scope is watchlist alerts only (the general "show everything" feed was
+// removed — see /areas/bse-xml-rss for the reasoning), so pollOnce itself
+// is cheap: it only fingerprints+dedupes the fetched feed and builds full
+// records for genuine new watchlist matches, never rebuilding a large
+// stored list on every poll. That's what makes repeating it BURST_POLLS
+// times affordable within the Workers Free plan's 10ms-per-invocation cap.
 async function pollBurst(env) {
-  const watchlist = await getWatchlist(env);
-  const settings = await getNotificationSettings(env);
-  const existing = await getRecentAnnouncements(env);
-  const existingMap = new Map();
-  for (const a of existing) existingMap.set(a.fingerprint, a);
-
-  let recentSeen = await getRecentSeen(env);
-  let seenSet = new Set(recentSeen);
-  const isBaseline = recentSeen.length === 0;
-
-  let alertFpSet = null;
-  let alerts = null;
-
+  const results = [];
   let totalNew = 0;
   let totalAlerts = 0;
-  let totalRows = 0;
-  let lastPage = null;
-  const results = [];
+
+  // Read once for the whole burst instead of once per poll — the
+  // watchlist rarely changes mid-burst, and this saves redundant
+  // KV reads + JSON.parse calls per cron tick.
+  const watchlist = await getWatchlist(env);
 
   for (let i = 0; i < BURST_POLLS; i++) {
-    const fetchedAt = new Date().toISOString();
-    let items = [];
-    try {
-      items = await fetchRssItems();
-    } catch (err) {
-      console.error("fetch failed:", err);
-      results.push({ ok: false, error: String(err) });
-      if (i < BURST_POLLS - 1) await sleep(BURST_GAP_MS);
-      continue;
-    }
-
-    const page = [];
-    for (let j = 0; j < items.length; j++) {
-      const fp = computeFingerprint(items[j]);
-      if (!fp) continue;
-      page.push({ item: items[j], fp });
-    }
-    lastPage = { page, fetchedAt };
-    totalRows += items.length;
-
-    if (isBaseline && i === 0) {
-      // First-ever run: record the current feed as the seen baseline, no alerts.
-      recentSeen = page.map((p) => p.fp);
-      seenSet = new Set(recentSeen);
-      results.push({ ok: true, status: "baseline", rows: items.length });
-      if (i < BURST_POLLS - 1) await sleep(BURST_GAP_MS);
-      continue;
-    }
-
-    const newOnes = page.filter((p) => !seenSet.has(p.fp));
-    let newAlertCount = 0;
-
-    if (newOnes.length && watchlist.length > 0) {
-      for (let k = 0; k < newOnes.length; k++) {
-        const { item, fp } = newOnes[k];
-        if (!matchesWatchlist(item, watchlist)) continue;
-
-        if (!alertFpSet) {
-          alertFpSet = new Set(await getAlertFingerprints(env));
-          alerts = await getAlerts(env);
-        }
-        if (alertFpSet.has(fp)) continue;
-
-        const company = extractCompanyFromTitle(item.title);
-        const scrip = String(item.scripcode || extractScripFromTitle(item.title) || "").trim();
-        const title = String(item.description || item.title || "New Announcement").trim();
-        const link = normalizeBseLink(item.link);
-        const pubDate = parsePubDateRss(item.pubDate);
-        const existingAnn = existingMap.get(fp);
-        const alertFetchedAt = existingAnn && existingAnn.fetchedAt ? existingAnn.fetchedAt : fetchedAt;
-
-        let telegramOk = false;
-        if (settings.telegram !== false) {
-          telegramOk = await sendTelegramAlert(`${company} (${scrip})`, title, scrip, link, alertFetchedAt, env);
-        }
-
-        if (telegramOk || settings.telegram === false) {
-          alerts.unshift({
-            company,
-            scrip,
-            title,
-            link,
-            fingerprint: fp,
-            pubDate,
-            fetchedAt: alertFetchedAt,
-            alert: true,
-            alertCreatedAt: new Date().toISOString(),
-          });
-          alertFpSet.add(fp);
-          newAlertCount++;
-        }
-      }
-    }
-
-    // Update in-memory seen state so the next sub-poll in this burst
-    // doesn't re-treat the same items as new (mirrors what a KV round-trip
-    // would have done, without the extra read/write).
-    if (newOnes.length) {
-      const addSet = new Set();
-      const updatedSeen = [];
-      for (const { fp } of newOnes) {
-        if (!addSet.has(fp)) {
-          addSet.add(fp);
-          updatedSeen.push(fp);
-        }
-      }
-      for (const fp of recentSeen) {
-        if (updatedSeen.length >= MAX_RECENT_SEEN) break;
-        if (!addSet.has(fp)) {
-          addSet.add(fp);
-          updatedSeen.push(fp);
-        }
-      }
-      recentSeen = updatedSeen;
-      seenSet = new Set(recentSeen);
-    }
-
-    totalNew += newOnes.length;
-    totalAlerts += newAlertCount;
-    results.push({ ok: true, newAnnouncements: newOnes.length, newAlerts: newAlertCount, rows: items.length });
-
+    const r = await pollOnce(env, watchlist);
+    results.push(r);
+    totalNew += r.newAnnouncements || 0;
+    totalAlerts += r.newAlerts || 0;
     if (i < BURST_POLLS - 1) await sleep(BURST_GAP_MS);
-  }
-
-  // Persist everything exactly once, using the final poll's feed snapshot
-  // (the BSE feed is cumulative, so the last poll already contains
-  // everything the earlier polls in this burst saw).
-  if (lastPage) {
-    const currentPageItems = lastPage.page.map(({ item, fp }) => {
-      const old = existingMap.get(fp);
-      const isAlert = old ? !!old.alert : matchesWatchlist(item, watchlist);
-      const originalFetchedAt = old && old.fetchedAt ? old.fetchedAt : lastPage.fetchedAt;
-      return itemToAnnouncement(item, originalFetchedAt, isAlert);
-    });
-    const seenFp = new Set(currentPageItems.map((a) => a.fingerprint));
-    const merged = [...currentPageItems];
-    for (const item of existing) {
-      if (merged.length >= MAX_RECENT_ANNOUNCEMENTS) break;
-      if (!seenFp.has(item.fingerprint)) {
-        seenFp.add(item.fingerprint);
-        merged.push(item);
-      }
-    }
-    await saveRecentAnnouncements(env, merged);
-  }
-
-  await saveRecentSeen(env, recentSeen);
-
-  if (totalAlerts > 0 && alerts && alertFpSet) {
-    await saveAlerts(env, alerts);
-    await saveAlertFingerprints(env, Array.from(alertFpSet));
   }
 
   return {
@@ -653,7 +459,6 @@ async function pollBurst(env) {
     gapMs: BURST_GAP_MS,
     newAnnouncements: totalNew,
     newAlerts: totalAlerts,
-    rows: totalRows,
     results,
   };
 }
@@ -698,7 +503,7 @@ export default {
       }
 
       if (url.pathname === "/announcements") {
-        const items = await getRecentAnnouncements(env);
+        const items = (await getAlerts(env)).slice(0, DISPLAY_LIMIT);
         return json({ ok: true, count: items.length, items });
       }
 
@@ -707,7 +512,7 @@ export default {
       }
 
       if (url.pathname === "/bse-announcements") {
-        const items = await getRecentAnnouncements(env);
+        const items = (await getAlerts(env)).slice(0, DISPLAY_LIMIT);
         return json({ ok: true, count: items.length, items });
       }
 
