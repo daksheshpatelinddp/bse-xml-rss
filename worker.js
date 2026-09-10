@@ -52,7 +52,7 @@ function escapeTelegramHtml(text) {
   return String(text || "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+    .replace/>/g, "&gt;");
 }
 
 async function sendTelegramAlert(title, body, scrip, link, fetchedAt, env) {
