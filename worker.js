@@ -3,11 +3,10 @@
  * - Official BSE RSS (XML)
  * - Original fetchedAt is permanent
  * - Alerts only for new watchlist matches
- * - Notifications: Telegram only
- * - Burst polling reads/writes KV once per cron invocation.
- * - RSS tag parsing uses precompiled regexes and bounded byte-range cutting.
- * - MAX_ITEMS_PER_POLL reduced to 50 to ensure 2 burst polls run strictly 
- *   under Cloudflare's Free 10ms CPU cap.
+ * - Notifications: Telegram only (ntfy removed)
+ * - Burst polling now reads/writes KV once per cron invocation instead of
+ *   once per sub-poll, and RSS tag parsing uses precompiled regexes, to
+ *   keep CPU time per invocation low (Workers Free plan caps this at 10ms).
  *
  * KV binding: BSE_XML_RSS_DATA
  * Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
@@ -19,8 +18,8 @@ const MAX_RECENT_SEEN = 800;
 const MAX_ALERTS = 500;       // how many watchlist matches to retain in KV history
 const DISPLAY_LIMIT = 50;     // how many of those the frontend feed shows
 
-const BURST_POLLS = 2;
-const BURST_GAP_MS = 25000;
+const BURST_POLLS = 4;
+const BURST_GAP_MS = 14000;
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -149,6 +148,10 @@ function matchesWatchlist(item, watchlist) {
   return false;
 }
 
+// Precompiled once at module load. Building a new RegExp per tag per item
+// (as the previous version did) recompiles the pattern on every call, which
+// is the main reason a single burst poll (3x over ~150 items x 5 tags) could
+// blow past the Workers Free plan's 10ms CPU budget for one invocation.
 const TAG_REGEXES = {
   title: /<title[^>]*>([\s\S]*?)<\/title>/i,
   link: /<link[^>]*>([\s\S]*?)<\/link>/i,
@@ -171,9 +174,24 @@ function extractTag(content, name) {
     .trim();
 }
 
-// Capped at 50 to keep execution time low for 2-burst polling
-const MAX_ITEMS_PER_POLL = 50;
+// Only the top of the feed can contain genuinely new items (BSE's RSS is
+// newest-first, and the rest of this file already assumes that ordering).
+// During active trading hours the live feed can carry many hundreds of
+// entries; fully parsing all of them (5 regex extractions + a fingerprint
+// each) on every sub-poll is what pushes a single invocation past the
+// Workers Free plan's 10ms CPU cap. Capping this is safe: it is extremely
+// unlikely BSE publishes more than this many brand-new filings inside one
+// polling interval.
+const MAX_ITEMS_PER_POLL = 120;
 
+// Finds only the byte range covering the newest MAX_ITEMS_PER_POLL <item>
+// blocks and returns that as a substring, WITHOUT scanning the rest of the
+// document. This matters because xmlText.split(/<item>/i) always scans the
+// entire input first and only discards the extra pieces afterward — so
+// capping "items kept" alone doesn't cap "text scanned". BSE's feed is
+// cumulative for the whole trading day, so the raw text keeps growing
+// hour by hour; this keeps per-poll cost tied to MAX_ITEMS_PER_POLL, not to
+// how much the feed has grown by that point in the day.
 const ITEM_OPEN_RE = /<item>/gi;
 
 function boundedItemsXml(xmlText, maxItems) {
@@ -314,6 +332,8 @@ async function pollOnce(env, cachedWatchlist) {
   const seenSet = new Set(recentSeen);
 
   if (recentSeen.length === 0) {
+    // Baseline run (first ever poll, or after a KV reset) — nothing to
+    // alert on yet, just record what we've seen.
     await saveRecentSeen(env, page.map((p) => p.fp));
     return { ok: true, status: "baseline", newAnnouncements: 0, newAlerts: 0, rows: items.length };
   }
@@ -406,11 +426,22 @@ async function pollOnce(env, cachedWatchlist) {
   };
 }
 
+// Scheduled (cron) entry point. Runs pollOnce BURST_POLLS times with a gap
+// between each, to catch announcements published mid-burst. This project's
+// scope is watchlist alerts only (the general "show everything" feed was
+// removed — see /areas/bse-xml-rss for the reasoning), so pollOnce itself
+// is cheap: it only fingerprints+dedupes the fetched feed and builds full
+// records for genuine new watchlist matches, never rebuilding a large
+// stored list on every poll. That's what makes repeating it BURST_POLLS
+// times affordable within the Workers Free plan's 10ms-per-invocation cap.
 async function pollBurst(env) {
   const results = [];
   let totalNew = 0;
   let totalAlerts = 0;
 
+  // Read once for the whole burst instead of once per poll — the
+  // watchlist rarely changes mid-burst, and this saves redundant
+  // KV reads + JSON.parse calls per cron tick.
   const watchlist = await getWatchlist(env);
 
   for (let i = 0; i < BURST_POLLS; i++) {
@@ -442,7 +473,7 @@ export default {
         return json({
           status: "running",
           app: "BSE XML RSS",
-          version: "1.2",
+          version: "1.1",
           note: "Original fetchedAt is permanent. Alerts only for new watchlist matches.",
         });
       }
@@ -489,26 +520,27 @@ export default {
         return json({ ok: true, categories: [] });
       }
 
-      if (url.pathname === "/clear-alert-fingerprints") {
-        await env.BSE_XML_RSS_DATA.put("alertFingerprints", "[]");
-        return json({ ok: true, message: "Alert fingerprints cleared. Next new matches will send notifications." });
-      }
+   if (url.pathname === "/clear-alert-fingerprints") {
+  await env.BSE_XML_RSS_DATA.put("alertFingerprints", "[]");
+  return json({ ok: true, message: "Alert fingerprints cleared. Next new matches will send notifications." });
+}
 
-      if (url.pathname === "/test-alert") {
-        const title = "TEST ALERT – BSE XML RSS";
-        const body = "This is a forced test message. If you receive this, Telegram is working correctly.";
-        const scrip = "000000";
-        const link = "https://www.bseindia.com";
-        const fetchedAt = new Date().toISOString();
+// Temporary force test – sends one Telegram message
+if (url.pathname === "/test-alert") {
+  const title = "TEST ALERT – BSE XML RSS";
+  const body = "This is a forced test message. If you receive this, Telegram is working correctly.";
+  const scrip = "000000";
+  const link = "https://www.bseindia.com";
+  const fetchedAt = new Date().toISOString();
 
-        const telegramOk = await sendTelegramAlert(title, body, scrip, link, fetchedAt, env);
+  const telegramOk = await sendTelegramAlert(title, body, scrip, link, fetchedAt, env);
 
-        return json({
-          ok: true,
-          telegram: telegramOk,
-          message: "Test alert sent. Check Telegram."
-        });
-      }
+  return json({
+    ok: true,
+    telegram: telegramOk,
+    message: "Test alert sent. Check Telegram."
+  });
+}
 
       return json({ error: "Not found" }, 404);
     } catch (err) {
