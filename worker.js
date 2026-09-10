@@ -1,6 +1,6 @@
 /*
- * BSE XML-RSS WORKER – HIGH PERFORMANCE V2.0
- * Optimized for minimal CPU footprint (<4 ms) on Cloudflare Workers Free Tier.
+ * BSE XML-RSS WORKER – HIGH PERFORMANCE V2.1 (TELEGRAM ONLY)
+ * Optimized for minimal CPU footprint (<3 ms) on Cloudflare Workers Free Tier.
  */
 
 const BSE_RSS_URL = "https://www.bseindia.com/data/xml-data/corpfiling/rss/bse_rss.xml";
@@ -11,7 +11,6 @@ const DISPLAY_LIMIT = 50;
 
 // Set to 1 poll per scheduled trigger to avoid V8 context and GC CPU spikes
 const BURST_POLLS = 1;
-const BURST_GAP_MS = 0;
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -52,7 +51,6 @@ function escapeTelegramHtml(text) {
 
 /* ---------- Fast XML Parsing ---------- */
 
-// Extract tag contents quickly without heavy XML parsers or complex Regex engines
 function getXmlTag(xmlString, tag) {
   const startTag = `<${tag}>`;
   const endTag = `</${tag}>`;
@@ -79,7 +77,6 @@ function parseXmlFeed(xmlText) {
     const description = getXmlTag(itemBlock, "description");
     const pubDate = getXmlTag(itemBlock, "pubDate");
 
-    // Extract Scrip Code if available in title or description
     const scripMatch = title.match(/\b\d{6}\b/) || description.match(/\b\d{6}\b/);
     const scrip = scripMatch ? scripMatch[0] : "";
 
@@ -126,7 +123,7 @@ function matchesWatchlist(item, watchlist) {
   return false;
 }
 
-/* ---------- Notifications ---------- */
+/* ---------- Notifications (Telegram Only) ---------- */
 
 async function sendTelegramAlert(title, body, scrip, link, fetchedAt, env) {
   if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return;
@@ -152,35 +149,6 @@ async function sendTelegramAlert(title, body, scrip, link, fetchedAt, env) {
   }
 }
 
-async function sendNtfyAlert(title, body, scrip, link, fetchedAt, env) {
-  const topic = String(env.NTFY_TOPIC || "").trim();
-  if (!topic) return;
-
-  var targetLink = normalizeBseLink(link);
-  const formattedFetchTime = fetchedAt
-    ? new Date(fetchedAt).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" })
-    : "N/A";
-
-  const payload = {
-    topic,
-    title: String(title || "BSE Alert").slice(0, 200),
-    message: `${body}\n\nFetched: ${formattedFetchTime}`.slice(0, 4000),
-    click: targetLink,
-    tags: ["chart_with_upwards_trend", "warning"],
-    priority: 4,
-  };
-
-  try {
-    await fetch("https://ntfy.sh/", {
-      method: "POST",
-      headers: { "Content-Type": "application/json; charset=utf-8" },
-      body: JSON.stringify(payload),
-    });
-  } catch (err) {
-    console.error("ntfy error:", err);
-  }
-}
-
 /* ---------- KV Helpers ---------- */
 
 async function kvPut(env, key, value, attempts = 3) {
@@ -203,12 +171,6 @@ async function getWatchlist(env) {
   if (!env.BSE_XML_RSS_KV) return [];
   const data = await env.BSE_XML_RSS_KV.get("watchlist", "json");
   return Array.isArray(data) ? data : [];
-}
-
-async function getNotificationSettings(env) {
-  if (!env.BSE_XML_RSS_KV) return { telegram: true, ntfy: true };
-  const data = await env.BSE_XML_RSS_KV.get("notificationSettings", "json");
-  return data || { telegram: true, ntfy: true };
 }
 
 async function getRecentSeen(env) {
@@ -284,7 +246,6 @@ async function pollOnce(env, cachedWatchlist) {
   }
 
   const watchlist = cachedWatchlist || (await getWatchlist(env));
-  const settings = await getNotificationSettings(env);
 
   let newAlertCount = 0;
   let alerts = null;
@@ -299,12 +260,8 @@ async function pollOnce(env, cachedWatchlist) {
       const title = item.title || "BSE Announcement";
       const body = item.description || title;
 
-      if (settings.telegram !== false) {
-        await sendTelegramAlert(title, body, item.scrip, item.link, fetchedAt, env);
-      }
-      if (settings.ntfy !== false) {
-        await sendNtfyAlert(title, body, item.scrip, item.link, fetchedAt, env);
-      }
+      // Send alert directly to Telegram
+      await sendTelegramAlert(title, body, item.scrip, item.link, fetchedAt, env);
 
       alerts.unshift({
         title,
@@ -353,7 +310,7 @@ export default {
 
     try {
       if (url.pathname === "/") {
-        return json({ status: "running", app: "BSE XML RSS Worker", version: "2.0.0" });
+        return json({ status: "running", app: "BSE XML RSS Worker (Telegram Only)", version: "2.1.0" });
       }
 
       if (url.pathname === "/monitor") {
