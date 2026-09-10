@@ -1,5 +1,5 @@
 /*
- * BSE XML-RSS WORKER – HIGH PERFORMANCE V2.3 (WITH INSTANT WATCHLIST PERSISTENCE)
+ * BSE XML-RSS WORKER – HIGH PERFORMANCE V2.3 (WITH TEST ALERT ROUTE)
  */
 
 const BSE_RSS_URL = "https://www.bseindia.com/data/xml-data/corpfiling/rss/bse_rss.xml";
@@ -313,7 +313,35 @@ export default {
         return json({ status: "running", app: "BSE XML RSS Worker", version: "2.3.0" });
       }
 
-      if (url.pathname === "/monitor") {
+      // -------------------------------------------------------------
+      // TEST TELEGRAM ALERT ENDPOINT
+      // -------------------------------------------------------------
+      if (url.pathname === "/test-alert") {
+        const testTitle = "TEST ALERT: Gujarat Themis Biosyn Ltd";
+        const testBody = "This is a test notification for GUJTHEM.";
+        const testScrip = "506879";
+        const testLink = "https://www.bseindia.com";
+        const fetchedAt = new Date().toISOString();
+
+        // 1. Send direct Telegram notification
+        await sendTelegramAlert(testTitle, testBody, testScrip, testLink, fetchedAt, env);
+
+        // 2. Persist mock alert into specialAlerts KV list for UI rendering
+        const alerts = await getAlerts(env);
+        alerts.unshift({
+          title: testTitle,
+          scrip: testScrip,
+          link: testLink,
+          pubDate: new Date().toUTCString(),
+          fetchedAt,
+          fingerprint: "test-fp-" + Date.now(),
+        });
+        await saveAlerts(env, alerts);
+
+        return json({ ok: true, message: "Test alert dispatched to Telegram & Dashboard!" });
+      }
+
+      if (url.pathname === "/check" || url.pathname === "/monitor") {
         return json(await pollOnce(env));
       }
 
