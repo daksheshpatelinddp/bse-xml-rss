@@ -189,7 +189,7 @@ async function sendTelegramAlert(title, body, scrip, link, fetchedAt, env) {
 /* ---------- KV Helpers ---------- */
 
 function getKvBinding(env) {
-  return env.BSE_XML_RSS_KV || env.BSE_XML_RSS_DATA;
+  return  env.BSE_XML_RSS_DATA;
 }
 
 async function kvPut(env, key, value, attempts = 3) {
