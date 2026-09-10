@@ -1,6 +1,6 @@
 /*
- * BSE XML-RSS WORKER – HIGH PERFORMANCE V2.2 (TELEGRAM ONLY + WATCHLIST ENDPOINTS)
- * Optimized for minimal CPU footprint (<2 ms) on Cloudflare Workers Free Tier.
+ * BSE XML-RSS WORKER – HIGH PERFORMANCE V2.2 (TELEGRAM ONLY + WATCHLIST CRUD)
+ * Optimized for minimal CPU footprint (<3 ms) on Cloudflare Workers Free Tier.
  */
 
 const BSE_RSS_URL = "https://www.bseindia.com/data/xml-data/corpfiling/rss/bse_rss.xml";
@@ -112,9 +112,11 @@ function matchesWatchlist(item, watchlist) {
 
   for (let i = 0; i < watchlist.length; i++) {
     const w = watchlist[i];
+    
+    // Support string items ("500209") or object items ({ scrip: "500209", name: "INFOSYS" })
     const ws = String(typeof w === "object" ? w.scrip || w.symbol || "" : w).trim();
     if (ws && itemScrip && ws === itemScrip) return true;
-    
+
     const wn = String(typeof w === "object" ? w.name || w.symbol || "" : w).toLowerCase().trim();
     if (wn.length >= 3 && itemTitle.includes(wn)) return true;
   }
@@ -263,7 +265,6 @@ async function pollOnce(env, cachedWatchlist) {
       const title = item.title || "BSE Announcement";
       const body = item.description || title;
 
-      // Send alert directly to Telegram
       await sendTelegramAlert(title, body, item.scrip, item.link, fetchedAt, env);
 
       alerts.unshift({
@@ -306,8 +307,6 @@ async function pollOnce(env, cachedWatchlist) {
   };
 }
 
-/* ---------- HTTP Server Handler ---------- */
-
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -327,13 +326,15 @@ export default {
         return json({ ok: true, count: items.length, items });
       }
 
-      // WATCHLIST ROUTING
+      // --- WATCHLIST ROUTES ---
       if (url.pathname === "/watchlist") {
+        // GET Watchlist
         if (request.method === "GET") {
           const list = await getWatchlist(env);
           return json({ ok: true, watchlist: list });
         }
 
+        // SAVE/POST Watchlist
         if (request.method === "POST" || request.method === "PUT") {
           const body = await request.json();
           const watchlist = Array.isArray(body) ? body : (body.watchlist || []);
@@ -341,6 +342,7 @@ export default {
           return json({ ok: true, count: watchlist.length, watchlist });
         }
 
+        // CLEAR Watchlist
         if (request.method === "DELETE") {
           await saveWatchlist(env, []);
           return json({ ok: true, message: "Watchlist cleared" });
