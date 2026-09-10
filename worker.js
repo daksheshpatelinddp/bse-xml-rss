@@ -1,16 +1,22 @@
 /*
- * BSE XML-RSS WORKER – HIGH PERFORMANCE V2.1 (TELEGRAM ONLY)
- * Optimized for minimal CPU footprint (<3 ms) on Cloudflare Workers Free Tier.
+ * BSE XML RSS – V1.3 (Telegram-only, Maximum CPU Optimization)
+ * - Uses zero-regex pointer-based XML parsing (indexOf loops) to eliminate V8 overhead.
+ * - Caps items at 50 per poll to ensure 2 burst runs stay well below Cloudflare's 10ms CPU limit.
+ * - Permanent fetchedAt timestamping and duplicate tracking via KV.
+ *
+ * KV binding: BSE_XML_RSS_DATA
+ * Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
  */
 
-const BSE_RSS_URL = "https://www.bseindia.com/data/xml-data/corpfiling/rss/bse_rss.xml";
+const BSE_RSS_URL = "https://www.bseindia.com/data/xml/announcements.xml";
 
 const MAX_RECENT_SEEN = 800;
-const MAX_ALERTS = 500;
-const DISPLAY_LIMIT = 50;
+const MAX_ALERTS = 500;       // How many watchlist matches to retain in KV history
+const DISPLAY_LIMIT = 50;     // How many of those the frontend feed shows
 
-// Set to 1 poll per scheduled trigger to avoid V8 context and GC CPU spikes
-const BURST_POLLS = 1;
+const BURST_POLLS = 2;
+const BURST_GAP_MS = 25000;
+const MAX_ITEMS_PER_POLL = 50;
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -46,95 +52,24 @@ function escapeTelegramHtml(text) {
   return String(text || "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+    .replace/>/g, "&gt;");
 }
-
-/* ---------- Fast XML Parsing ---------- */
-
-function getXmlTag(xmlString, tag) {
-  const startTag = `<${tag}>`;
-  const endTag = `</${tag}>`;
-  const startIndex = xmlString.indexOf(startTag);
-  if (startIndex === -1) return "";
-  const endIndex = xmlString.indexOf(endTag, startIndex + startTag.length);
-  if (endIndex === -1) return "";
-  return xmlString.slice(startIndex + startTag.length, endIndex).trim();
-}
-
-function parseXmlFeed(xmlText) {
-  const items = [];
-  let pos = 0;
-
-  while (true) {
-    const itemStart = xmlText.indexOf("<item>", pos);
-    if (itemStart === -1) break;
-    const itemEnd = xmlText.indexOf("</item>", itemStart);
-    if (itemEnd === -1) break;
-
-    const itemBlock = xmlText.slice(itemStart + 6, itemEnd);
-    const title = getXmlTag(itemBlock, "title");
-    const link = getXmlTag(itemBlock, "link");
-    const description = getXmlTag(itemBlock, "description");
-    const pubDate = getXmlTag(itemBlock, "pubDate");
-
-    const scripMatch = title.match(/\b\d{6}\b/) || description.match(/\b\d{6}\b/);
-    const scrip = scripMatch ? scripMatch[0] : "";
-
-    items.push({
-      title,
-      link,
-      description,
-      pubDate,
-      scrip,
-    });
-
-    pos = itemEnd + 7;
-  }
-
-  return items;
-}
-
-function computeFingerprint(item) {
-  const link = String(item.link || "").trim().toLowerCase();
-  if (link && link.includes("attachlive")) {
-    const file = link.split("/").pop();
-    if (file) return `att:${file}`;
-  }
-  const scrip = String(item.scrip || "").trim();
-  const title = String(item.title || "")
-    .toLowerCase()
-    .replace(/\s+/g, " ")
-    .trim();
-  return `rss:${scrip}|${title}`;
-}
-
-function matchesWatchlist(item, watchlist) {
-  if (!watchlist || !watchlist.length) return false;
-  const itemScrip = String(item.scrip || "").trim();
-  const itemTitle = String(item.title || "").toLowerCase().trim();
-
-  for (let i = 0; i < watchlist.length; i++) {
-    const w = watchlist[i];
-    const ws = String(w.scrip || "").trim();
-    if (ws && itemScrip && ws === itemScrip) return true;
-    const wn = String(w.name || "").toLowerCase().trim();
-    if (wn.length >= 3 && itemTitle.includes(wn)) return true;
-  }
-  return false;
-}
-
-/* ---------- Notifications (Telegram Only) ---------- */
 
 async function sendTelegramAlert(title, body, scrip, link, fetchedAt, env) {
-  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return;
-  var targetLink = normalizeBseLink(link);
+  if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return false;
+  var pdfLink = normalizeBseLink(link);
+  var targetLink =
+    pdfLink && pdfLink !== "https://www.bseindia.com"
+      ? pdfLink
+      : scrip
+        ? "https://www.bseindia.com/stock-share-price/" + scrip
+        : "https://www.bseindia.com";
   const formattedFetchTime = fetchedAt
     ? new Date(fetchedAt).toLocaleTimeString("en-IN", { timeZone: "Asia/Kolkata" })
     : "N/A";
-  const messageText = `🔔 <b>${escapeTelegramHtml(title)}</b>\n\n${escapeTelegramHtml(body)}\n\n⏱ <b>Fetched:</b> ${formattedFetchTime}\n📎 <a href="${targetLink}">View Document</a>`;
-  
+  const messageText = `🔔 <b>${escapeTelegramHtml(title)}</b>\n\n${escapeTelegramHtml(body)}\n\n⏱ <b>Fetched:</b> ${formattedFetchTime}\n📎 <a href="${targetLink}">View</a>`;
   try {
-    await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
+    const res = await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -144,88 +79,231 @@ async function sendTelegramAlert(title, body, scrip, link, fetchedAt, env) {
         disable_web_page_preview: false,
       }),
     });
+    return res.ok;
   } catch (err) {
     console.error("Telegram error:", err);
+    return false;
   }
 }
 
-/* ---------- KV Helpers ---------- */
-
-async function kvPut(env, key, value, attempts = 3) {
-  let lastErr;
-  for (let i = 0; i < attempts; i++) {
-    try {
-      await env.BSE_XML_RSS_KV.put(key, value);
-      return;
-    } catch (err) {
-      lastErr = err;
-      if (i < attempts - 1) {
-        await sleep(1050 + Math.floor(Math.random() * 400));
+function parsePubDateRss(raw) {
+  if (!raw) return "";
+  const s = String(raw).trim();
+  try {
+    const m = s.match(/^(\d{1,2})-([A-Za-z]{3})-(\d{4})\s+(\d{1,2}):(\d{2}):(\d{2})$/);
+    if (m) {
+      const months = { Jan:0,Feb:1,Mar:2,Apr:3,May:4,Jun:5,Jul:6,Aug:7,Sep:8,Oct:9,Nov:10,Dec:11 };
+      const mon = months[m[2]];
+      if (mon !== undefined) {
+        const d = new Date(Date.UTC(+m[3], mon, +m[1], +m[4] - 5, +m[5] - 30, +m[6]));
+        if (!isNaN(d.getTime())) return d.toISOString();
       }
     }
-  }
-  throw lastErr;
+    const d = new Date(s);
+    if (!isNaN(d.getTime())) return d.toISOString();
+  } catch (e) {}
+  return s;
 }
 
+function extractScripFromTitle(title) {
+  const m = String(title || "").match(/\((\d{6,})\)\s*$/);
+  return m ? m[1] : "";
+}
+
+function extractCompanyFromTitle(title) {
+  return String(title || "").replace(/\s*\(\d{6,}\)\s*$/, "").trim() || "Company";
+}
+
+function computeFingerprint(item) {
+  const link = String(item.link || "").trim().toLowerCase();
+  if (link) {
+    const file = link.split("/").pop();
+    if (file && file.length > 8) return `att:${file}`;
+  }
+  const scrip = String(item.scripcode || extractScripFromTitle(item.title) || "").trim();
+  const desc = String(item.description || "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120);
+  const day = String(item.pubDate || "").slice(0, 10);
+  return `st:${scrip}|${desc}|${day}`;
+}
+
+function matchesWatchlist(item, watchlist) {
+  if (!watchlist || !watchlist.length) return false;
+  const itemScrip = String(item.scripcode || extractScripFromTitle(item.title) || "").trim();
+  const itemCompany = extractCompanyFromTitle(item.title).toLowerCase();
+
+  for (let i = 0; i < watchlist.length; i++) {
+    const w = watchlist[i];
+    const ws = String(w.scrip || "").trim();
+    if (ws && itemScrip && ws === itemScrip) return true;
+    const wn = String(w.name || "").toLowerCase().trim();
+    if (wn.length >= 3 && itemCompany && itemCompany.indexOf(wn) !== -1) return true;
+  }
+  return false;
+}
+
+/* =========================================================================
+   ZERO-REGEX INDEX PARSER (MAXIMUM PERFORMANCE)
+   ========================================================================= */
+
+function extractTagValue(xml, tagName, startPos, endPos) {
+  const openTag = `<${tagName}>`;
+  const closeTag = `</${tagName}>`;
+  const oIdx = xml.indexOf(openTag, startPos);
+  if (oIdx === -1 || oIdx >= endPos) return "";
+  const vStart = oIdx + openTag.length;
+  const cIdx = xml.indexOf(closeTag, vStart);
+  if (cIdx === -1 || cIdx >= endPos) return "";
+
+  let val = xml.slice(vStart, cIdx);
+  if (val.startsWith("<![CDATA[")) {
+    val = val.slice(9, -3);
+  }
+  return val
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .trim();
+}
+
+function parseRssItems(xmlText) {
+  const items = [];
+  let pos = 0;
+  let count = 0;
+
+  while (count < MAX_ITEMS_PER_POLL) {
+    const itemStart = xmlText.indexOf("<item>", pos);
+    if (itemStart === -1) break;
+
+    const itemEnd = xmlText.indexOf("</item>", itemStart);
+    if (itemEnd === -1) break;
+
+    const title = extractTagValue(xmlText, "title", itemStart, itemEnd);
+    const description = extractTagValue(xmlText, "description", itemStart, itemEnd);
+
+    if (title || description) {
+      items.push({
+        title,
+        link: extractTagValue(xmlText, "link", itemStart, itemEnd),
+        description,
+        pubDate: extractTagValue(xmlText, "pubDate", itemStart, itemEnd),
+        scripcode: extractTagValue(xmlText, "scripcode", itemStart, itemEnd),
+      });
+    }
+
+    pos = itemEnd + 7; // Move pointer past </item>
+    count++;
+  }
+
+  return items;
+}
+
+/* =========================================================================
+   STORAGE HELPERS (KV)
+   ========================================================================= */
+
 async function getWatchlist(env) {
-  if (!env.BSE_XML_RSS_KV) return [];
-  const data = await env.BSE_XML_RSS_KV.get("watchlist", "json");
+  if (!env.BSE_XML_RSS_DATA) return [];
+  const data = await env.BSE_XML_RSS_DATA.get("watchlist", "json");
   return Array.isArray(data) ? data : [];
 }
 
+async function setWatchlist(env, watchlist) {
+  if (!env.BSE_XML_RSS_DATA) throw new Error("BSE_XML_RSS_DATA is not bound.");
+  await env.BSE_XML_RSS_DATA.put("watchlist", JSON.stringify(watchlist));
+}
+
+async function getNotificationSettings(env) {
+  if (!env.BSE_XML_RSS_DATA) return { telegram: true };
+  const data = await env.BSE_XML_RSS_DATA.get("notificationSettings", "json");
+  return data || { telegram: true };
+}
+
+async function setNotificationSettings(env, settings) {
+  if (!env.BSE_XML_RSS_DATA) throw new Error("BSE_XML_RSS_DATA is not bound.");
+  await env.BSE_XML_RSS_DATA.put("notificationSettings", JSON.stringify(settings));
+}
+
 async function getRecentSeen(env) {
-  if (!env.BSE_XML_RSS_KV) return [];
-  const data = await env.BSE_XML_RSS_KV.get("recentSeen", "json");
+  if (!env.BSE_XML_RSS_DATA) return [];
+  const data = await env.BSE_XML_RSS_DATA.get("recentSeen", "json");
   return Array.isArray(data) ? data : [];
 }
 
 async function saveRecentSeen(env, ids) {
-  if (!env.BSE_XML_RSS_KV) return;
-  await kvPut(env, "recentSeen", JSON.stringify(ids.slice(0, MAX_RECENT_SEEN)));
+  if (!env.BSE_XML_RSS_DATA) return;
+  await env.BSE_XML_RSS_DATA.put("recentSeen", JSON.stringify(ids.slice(0, MAX_RECENT_SEEN)));
+}
+
+async function getAlertFingerprints(env) {
+  if (!env.BSE_XML_RSS_DATA) return [];
+  const data = await env.BSE_XML_RSS_DATA.get("alertFingerprints", "json");
+  return Array.isArray(data) ? data : [];
+}
+
+async function saveAlertFingerprints(env, list) {
+  if (!env.BSE_XML_RSS_DATA) return;
+  await env.BSE_XML_RSS_DATA.put("alertFingerprints", JSON.stringify(list.slice(0, MAX_ALERTS * 2)));
 }
 
 async function getAlerts(env) {
-  if (!env.BSE_XML_RSS_KV) return [];
-  const data = await env.BSE_XML_RSS_KV.get("specialAlerts", "json");
+  if (!env.BSE_XML_RSS_DATA) return [];
+  const data = await env.BSE_XML_RSS_DATA.get("specialAlerts", "json");
   return Array.isArray(data) ? data : [];
 }
 
 async function saveAlerts(env, alerts) {
-  if (!env.BSE_XML_RSS_KV) return;
-  await kvPut(env, "specialAlerts", JSON.stringify(alerts.slice(0, MAX_ALERTS)));
+  if (!env.BSE_XML_RSS_DATA) return;
+  await env.BSE_XML_RSS_DATA.put("specialAlerts", JSON.stringify(alerts.slice(0, MAX_ALERTS)));
 }
 
-/* ---------- Core Poll Function ---------- */
+/* =========================================================================
+   POLLING & ENGINE LOGIC
+   ========================================================================= */
+
+async function fetchRssItems() {
+  const response = await fetch(BSE_RSS_URL, {
+    method: "GET",
+    headers: {
+      "User-Agent":
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+      Accept: "application/rss+xml, application/xml, text/xml, */*",
+      Referer: "https://www.bseindia.com/",
+      "Cache-Control": "no-cache",
+    },
+    cf: { cacheTtl: 0, cacheEverything: false },
+  });
+
+  if (!response.ok) throw new Error(`BSE RSS HTTP ${response.status}`);
+  const xml = await response.text();
+  return parseRssItems(xml);
+}
 
 async function pollOnce(env, cachedWatchlist) {
   const fetchedAt = new Date().toISOString();
-  let xmlText = "";
-
+  let items = [];
   try {
-    const response = await fetch(BSE_RSS_URL, {
-      method: "GET",
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
-        "Cache-Control": "no-cache",
-      },
-      cf: { cacheTtl: 0, cacheEverything: false },
-    });
-    if (!response.ok) throw new Error(`BSE XML HTTP ${response.status}`);
-    xmlText = await response.text();
+    items = await fetchRssItems();
   } catch (err) {
-    console.error("XML Fetch Error:", err);
-    return { ok: false, error: String(err) };
+    console.error("fetch failed:", err);
+    return { ok: false, error: String(err), newAnnouncements: 0, newAlerts: 0 };
   }
 
-  const items = parseXmlFeed(xmlText);
   if (!items.length) {
     return { ok: true, newAnnouncements: 0, newAlerts: 0, rows: 0 };
   }
 
   const page = [];
   for (let i = 0; i < items.length; i++) {
-    const fp = computeFingerprint(items[i]);
-    if (fp) page.push({ item: items[i], fp });
+    const it = items[i];
+    const fp = computeFingerprint(it);
+    if (!fp) continue;
+    page.push({ item: it, fp });
   }
 
   const recentSeen = await getRecentSeen(env);
@@ -246,41 +324,60 @@ async function pollOnce(env, cachedWatchlist) {
   }
 
   const watchlist = cachedWatchlist || (await getWatchlist(env));
+  const settings = await getNotificationSettings(env);
 
   let newAlertCount = 0;
   let alerts = null;
+  let alertFpSet = null;
 
   if (watchlist.length > 0) {
     for (let i = 0; i < newOnes.length; i++) {
       const { item, fp } = newOnes[i];
       if (!matchesWatchlist(item, watchlist)) continue;
 
-      if (!alerts) alerts = await getAlerts(env);
+      if (!alertFpSet) {
+        alertFpSet = new Set(await getAlertFingerprints(env));
+        alerts = await getAlerts(env);
+      }
+      if (alertFpSet.has(fp)) continue;
 
-      const title = item.title || "BSE Announcement";
-      const body = item.description || title;
+      const company = extractCompanyFromTitle(item.title);
+      const scrip = String(item.scripcode || extractScripFromTitle(item.title) || "").trim();
+      const title = String(item.description || item.title || "New Announcement").trim();
+      const link = normalizeBseLink(item.link);
+      const pubDate = parsePubDateRss(item.pubDate);
 
-      // Send alert directly to Telegram
-      await sendTelegramAlert(title, body, item.scrip, item.link, fetchedAt, env);
+      let telegramOk = false;
+      if (settings.telegram !== false) {
+        telegramOk = await sendTelegramAlert(`${company} (${scrip})`, title, scrip, link, fetchedAt, env);
+      }
 
-      alerts.unshift({
-        title,
-        scrip: item.scrip,
-        link: item.link,
-        pubDate: item.pubDate,
-        fetchedAt,
-        fingerprint: fp,
-      });
-      newAlertCount++;
+      if (telegramOk || settings.telegram === false) {
+        alerts.unshift({
+          company,
+          scrip,
+          title,
+          link,
+          fingerprint: fp,
+          pubDate,
+          fetchedAt,
+          alert: true,
+          alertCreatedAt: new Date().toISOString(),
+        });
+        alertFpSet.add(fp);
+        newAlertCount++;
+      }
     }
   }
 
-  // Update Recent Seen list
   const updatedSeen = [];
   const addSet = new Set();
   for (let i = 0; i < newOnes.length; i++) {
-    addSet.add(newOnes[i].fp);
-    updatedSeen.push(newOnes[i].fp);
+    const fp = newOnes[i].fp;
+    if (!addSet.has(fp)) {
+      addSet.add(fp);
+      updatedSeen.push(fp);
+    }
   }
   for (let i = 0; i < recentSeen.length; i++) {
     if (updatedSeen.length >= MAX_RECENT_SEEN) break;
@@ -289,10 +386,11 @@ async function pollOnce(env, cachedWatchlist) {
       updatedSeen.push(recentSeen[i]);
     }
   }
-
   await saveRecentSeen(env, updatedSeen);
-  if (newAlertCount > 0 && alerts) {
+
+  if (newAlertCount > 0 && alerts && alertFpSet) {
     await saveAlerts(env, alerts);
+    await saveAlertFingerprints(env, Array.from(alertFpSet));
   }
 
   return {
@@ -300,8 +398,39 @@ async function pollOnce(env, cachedWatchlist) {
     newAnnouncements: newOnes.length,
     newAlerts: newAlertCount,
     rows: items.length,
+    totalSeen: updatedSeen.length,
   };
 }
+
+async function pollBurst(env) {
+  const results = [];
+  let totalNew = 0;
+  let totalAlerts = 0;
+
+  const watchlist = await getWatchlist(env);
+
+  for (let i = 0; i < BURST_POLLS; i++) {
+    const r = await pollOnce(env, watchlist);
+    results.push(r);
+    totalNew += r.newAnnouncements || 0;
+    totalAlerts += r.newAlerts || 0;
+    if (i < BURST_POLLS - 1) await sleep(BURST_GAP_MS);
+  }
+
+  return {
+    ok: true,
+    mode: "burst",
+    polls: BURST_POLLS,
+    gapMs: BURST_GAP_MS,
+    newAnnouncements: totalNew,
+    newAlerts: totalAlerts,
+    results,
+  };
+}
+
+/* =========================================================================
+   ENTRY POINTS
+   ========================================================================= */
 
 export default {
   async fetch(request, env) {
@@ -310,16 +439,66 @@ export default {
 
     try {
       if (url.pathname === "/") {
-        return json({ status: "running", app: "BSE XML RSS Worker (Telegram Only)", version: "2.1.0" });
+        return json({
+          status: "running",
+          app: "BSE XML RSS",
+          version: "1.3",
+          note: "Zero-regex parsing active. Permanent fetchedAt timestamps.",
+        });
       }
 
       if (url.pathname === "/monitor") {
+        const burst = url.searchParams.get("burst") === "1";
+        if (burst) return json(await pollBurst(env));
         return json(await pollOnce(env));
       }
 
-      if (url.pathname === "/announcements" || url.pathname === "/alerts") {
+      if (url.pathname === "/watchlist") {
+        if (request.method === "GET") return json({ ok: true, watchlist: await getWatchlist(env) });
+        if (request.method === "POST") {
+          const body = await request.json();
+          await setWatchlist(env, body.watchlist || []);
+          return json({ ok: true, watchlist: body.watchlist });
+        }
+      }
+
+      if (url.pathname === "/notification-settings") {
+        if (request.method === "GET") return json({ ok: true, settings: await getNotificationSettings(env) });
+        if (request.method === "POST") {
+          const body = await request.json();
+          await setNotificationSettings(env, body);
+          return json({ ok: true, settings: body });
+        }
+      }
+
+      if (url.pathname === "/announcements" || url.pathname === "/bse-announcements") {
         const items = (await getAlerts(env)).slice(0, DISPLAY_LIMIT);
         return json({ ok: true, count: items.length, items });
+      }
+
+      if (url.pathname === "/alerts") {
+        return json({ ok: true, items: await getAlerts(env) });
+      }
+
+      if (url.pathname === "/clear-alert-fingerprints") {
+        await env.BSE_XML_RSS_DATA.put("alertFingerprints", "[]");
+        return json({ ok: true, message: "Alert fingerprints cleared." });
+      }
+
+      if (url.pathname === "/test-alert") {
+        const title = "TEST ALERT – BSE XML RSS";
+        const body = "This is a forced test message from the CPU-optimized worker.";
+        const scrip = "000000";
+        const link = "https://www.bseindia.com";
+        const fetchedAt = new Date().toISOString();
+
+        const telegramOk = await sendTelegramAlert(title, body, scrip, link, fetchedAt, env);
+
+        return json({
+          ok: true,
+          telegram: telegramOk,
+          message: "Test alert sent. Check Telegram.",
+        });
       }
 
       return json({ error: "Not found" }, 404);
@@ -329,6 +508,6 @@ export default {
   },
 
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(pollOnce(env));
+    ctx.waitUntil(pollBurst(env));
   },
 };
