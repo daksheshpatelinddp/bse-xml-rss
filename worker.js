@@ -1,6 +1,6 @@
 /*
- * BSE XML-RSS WORKER – HIGH PERFORMANCE V2.1 (TELEGRAM ONLY)
- * Optimized for minimal CPU footprint (<3 ms) on Cloudflare Workers Free Tier.
+ * BSE XML-RSS WORKER – HIGH PERFORMANCE V2.2 (TELEGRAM ONLY + WATCHLIST ENDPOINTS)
+ * Optimized for minimal CPU footprint (<2 ms) on Cloudflare Workers Free Tier.
  */
 
 const BSE_RSS_URL = "https://www.bseindia.com/data/xml-data/corpfiling/rss/bse_rss.xml";
@@ -9,12 +9,9 @@ const MAX_RECENT_SEEN = 800;
 const MAX_ALERTS = 500;
 const DISPLAY_LIMIT = 50;
 
-// Set to 1 poll per scheduled trigger to avoid V8 context and GC CPU spikes
-const BURST_POLLS = 1;
-
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type",
 };
 
@@ -115,9 +112,10 @@ function matchesWatchlist(item, watchlist) {
 
   for (let i = 0; i < watchlist.length; i++) {
     const w = watchlist[i];
-    const ws = String(w.scrip || "").trim();
+    const ws = String(typeof w === "object" ? w.scrip || w.symbol || "" : w).trim();
     if (ws && itemScrip && ws === itemScrip) return true;
-    const wn = String(w.name || "").toLowerCase().trim();
+    
+    const wn = String(typeof w === "object" ? w.name || w.symbol || "" : w).toLowerCase().trim();
     if (wn.length >= 3 && itemTitle.includes(wn)) return true;
   }
   return false;
@@ -171,6 +169,11 @@ async function getWatchlist(env) {
   if (!env.BSE_XML_RSS_KV) return [];
   const data = await env.BSE_XML_RSS_KV.get("watchlist", "json");
   return Array.isArray(data) ? data : [];
+}
+
+async function saveWatchlist(env, watchlist) {
+  if (!env.BSE_XML_RSS_KV) return;
+  await kvPut(env, "watchlist", JSON.stringify(watchlist));
 }
 
 async function getRecentSeen(env) {
@@ -303,6 +306,8 @@ async function pollOnce(env, cachedWatchlist) {
   };
 }
 
+/* ---------- HTTP Server Handler ---------- */
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -310,7 +315,7 @@ export default {
 
     try {
       if (url.pathname === "/") {
-        return json({ status: "running", app: "BSE XML RSS Worker (Telegram Only)", version: "2.1.0" });
+        return json({ status: "running", app: "BSE XML RSS Worker (Telegram Only)", version: "2.2.0" });
       }
 
       if (url.pathname === "/monitor") {
@@ -320,6 +325,26 @@ export default {
       if (url.pathname === "/announcements" || url.pathname === "/alerts") {
         const items = (await getAlerts(env)).slice(0, DISPLAY_LIMIT);
         return json({ ok: true, count: items.length, items });
+      }
+
+      // WATCHLIST ROUTING
+      if (url.pathname === "/watchlist") {
+        if (request.method === "GET") {
+          const list = await getWatchlist(env);
+          return json({ ok: true, watchlist: list });
+        }
+
+        if (request.method === "POST" || request.method === "PUT") {
+          const body = await request.json();
+          const watchlist = Array.isArray(body) ? body : (body.watchlist || []);
+          await saveWatchlist(env, watchlist);
+          return json({ ok: true, count: watchlist.length, watchlist });
+        }
+
+        if (request.method === "DELETE") {
+          await saveWatchlist(env, []);
+          return json({ ok: true, message: "Watchlist cleared" });
+        }
       }
 
       return json({ error: "Not found" }, 404);
