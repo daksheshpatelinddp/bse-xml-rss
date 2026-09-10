@@ -1,5 +1,6 @@
 /*
- * BSE XML-RSS WORKER – HIGH PERFORMANCE V2.3 (WITH TEST ALERT ROUTE)
+ * BSE XML-RSS WORKER – HIGH PERFORMANCE V2.1 (TELEGRAM ONLY)
+ * Optimized for minimal CPU footprint (<3 ms) on Cloudflare Workers Free Tier.
  */
 
 const BSE_RSS_URL = "https://www.bseindia.com/data/xml-data/corpfiling/rss/bse_rss.xml";
@@ -8,13 +9,13 @@ const MAX_RECENT_SEEN = 800;
 const MAX_ALERTS = 500;
 const DISPLAY_LIMIT = 50;
 
-// Memory Cache to bypass Cloudflare KV 60-second read delay
-let MEMORY_WATCHLIST = null;
+// Set to 1 poll per scheduled trigger to avoid V8 context and GC CPU spikes
+const BURST_POLLS = 1;
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-  "Access-Control-Allow-Headers": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type",
 };
 
 function json(data, status = 200) {
@@ -79,7 +80,14 @@ function parseXmlFeed(xmlText) {
     const scripMatch = title.match(/\b\d{6}\b/) || description.match(/\b\d{6}\b/);
     const scrip = scripMatch ? scripMatch[0] : "";
 
-    items.push({ title, link, description, pubDate, scrip });
+    items.push({
+      title,
+      link,
+      description,
+      pubDate,
+      scrip,
+    });
+
     pos = itemEnd + 7;
   }
 
@@ -93,7 +101,10 @@ function computeFingerprint(item) {
     if (file) return `att:${file}`;
   }
   const scrip = String(item.scrip || "").trim();
-  const title = String(item.title || "").toLowerCase().replace(/\s+/g, " ").trim();
+  const title = String(item.title || "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim();
   return `rss:${scrip}|${title}`;
 }
 
@@ -104,16 +115,15 @@ function matchesWatchlist(item, watchlist) {
 
   for (let i = 0; i < watchlist.length; i++) {
     const w = watchlist[i];
-    const ws = String(typeof w === "object" ? w.scrip || w.symbol || w.code || "" : w).trim();
+    const ws = String(w.scrip || "").trim();
     if (ws && itemScrip && ws === itemScrip) return true;
-
-    const wn = String(typeof w === "object" ? w.name || w.symbol || w.company || "" : w).toLowerCase().trim();
+    const wn = String(w.name || "").toLowerCase().trim();
     if (wn.length >= 3 && itemTitle.includes(wn)) return true;
   }
   return false;
 }
 
-/* ---------- Telegram Notification ---------- */
+/* ---------- Notifications (Telegram Only) ---------- */
 
 async function sendTelegramAlert(title, body, scrip, link, fetchedAt, env) {
   if (!env.TELEGRAM_BOT_TOKEN || !env.TELEGRAM_CHAT_ID) return;
@@ -149,24 +159,18 @@ async function kvPut(env, key, value, attempts = 3) {
       return;
     } catch (err) {
       lastErr = err;
-      if (i < attempts - 1) await sleep(1000);
+      if (i < attempts - 1) {
+        await sleep(1050 + Math.floor(Math.random() * 400));
+      }
     }
   }
   throw lastErr;
 }
 
 async function getWatchlist(env) {
-  if (MEMORY_WATCHLIST !== null) return MEMORY_WATCHLIST;
   if (!env.BSE_XML_RSS_KV) return [];
   const data = await env.BSE_XML_RSS_KV.get("watchlist", "json");
-  MEMORY_WATCHLIST = Array.isArray(data) ? data : [];
-  return MEMORY_WATCHLIST;
-}
-
-async function saveWatchlist(env, watchlist) {
-  MEMORY_WATCHLIST = watchlist;
-  if (!env.BSE_XML_RSS_KV) return;
-  await kvPut(env, "watchlist", JSON.stringify(watchlist));
+  return Array.isArray(data) ? data : [];
 }
 
 async function getRecentSeen(env) {
@@ -256,6 +260,7 @@ async function pollOnce(env, cachedWatchlist) {
       const title = item.title || "BSE Announcement";
       const body = item.description || title;
 
+      // Send alert directly to Telegram
       await sendTelegramAlert(title, body, item.scrip, item.link, fetchedAt, env);
 
       alerts.unshift({
@@ -270,6 +275,7 @@ async function pollOnce(env, cachedWatchlist) {
     }
   }
 
+  // Update Recent Seen list
   const updatedSeen = [];
   const addSet = new Set();
   for (let i = 0; i < newOnes.length; i++) {
@@ -297,51 +303,17 @@ async function pollOnce(env, cachedWatchlist) {
   };
 }
 
-/* ---------- Request Handler ---------- */
-
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
-
-    // Handle Preflight OPTIONS Request
-    if (request.method === "OPTIONS") {
-      return new Response(null, { headers: CORS_HEADERS });
-    }
+    if (request.method === "OPTIONS") return new Response(null, { headers: CORS_HEADERS });
 
     try {
       if (url.pathname === "/") {
-        return json({ status: "running", app: "BSE XML RSS Worker", version: "2.3.0" });
+        return json({ status: "running", app: "BSE XML RSS Worker (Telegram Only)", version: "2.1.0" });
       }
 
-      // -------------------------------------------------------------
-      // TEST TELEGRAM ALERT ENDPOINT
-      // -------------------------------------------------------------
-      if (url.pathname === "/test-alert") {
-        const testTitle = "TEST ALERT: Gujarat Themis Biosyn Ltd";
-        const testBody = "This is a test notification for GUJTHEM.";
-        const testScrip = "506879";
-        const testLink = "https://www.bseindia.com";
-        const fetchedAt = new Date().toISOString();
-
-        // 1. Send direct Telegram notification
-        await sendTelegramAlert(testTitle, testBody, testScrip, testLink, fetchedAt, env);
-
-        // 2. Persist mock alert into specialAlerts KV list for UI rendering
-        const alerts = await getAlerts(env);
-        alerts.unshift({
-          title: testTitle,
-          scrip: testScrip,
-          link: testLink,
-          pubDate: new Date().toUTCString(),
-          fetchedAt,
-          fingerprint: "test-fp-" + Date.now(),
-        });
-        await saveAlerts(env, alerts);
-
-        return json({ ok: true, message: "Test alert dispatched to Telegram & Dashboard!" });
-      }
-
-      if (url.pathname === "/check" || url.pathname === "/monitor") {
+      if (url.pathname === "/monitor") {
         return json(await pollOnce(env));
       }
 
@@ -350,42 +322,7 @@ export default {
         return json({ ok: true, count: items.length, items });
       }
 
-      // WATCHLIST ROUTE
-      if (url.pathname === "/watchlist") {
-        if (request.method === "GET") {
-          const list = await getWatchlist(env);
-          return json({ ok: true, watchlist: list, count: list.length });
-        }
-
-        if (request.method === "POST" || request.method === "PUT") {
-          let parsedData;
-          try {
-            parsedData = await request.json();
-          } catch (e) {
-            const rawText = await request.text();
-            parsedData = rawText.split("\n").map((line) => line.trim()).filter(Boolean);
-          }
-
-          let finalWatchlist = [];
-          if (Array.isArray(parsedData)) {
-            finalWatchlist = parsedData;
-          } else if (parsedData && Array.isArray(parsedData.watchlist)) {
-            finalWatchlist = parsedData.watchlist;
-          } else if (parsedData && Array.isArray(parsedData.symbols)) {
-            finalWatchlist = parsedData.symbols;
-          }
-
-          await saveWatchlist(env, finalWatchlist);
-          return json({ ok: true, count: finalWatchlist.length, watchlist: finalWatchlist });
-        }
-
-        if (request.method === "DELETE") {
-          await saveWatchlist(env, []);
-          return json({ ok: true, message: "Watchlist cleared" });
-        }
-      }
-
-      return json({ error: "Endpoint not found" }, 404);
+      return json({ error: "Not found" }, 404);
     } catch (err) {
       return json({ error: err.message }, 500);
     }
