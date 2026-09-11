@@ -1,7 +1,7 @@
 /*
  * BSE XML-RSS WORKER – HIGH PERFORMANCE V2.2 (TELEGRAM ONLY)
  * Merged Features: Watchlist CRUD, Notification Settings, Fingerprint Tracking, and Test Endpoints.
- * Maintained: Ultra-low CPU (<3ms) pointer-based XML parsing & KV logic from worker best ct.
+ * Maintained: Ultra-low CPU (<3ms) pointer-based XML parsing & KV logic from worker best cpu time.
  */
 
 const BSE_RSS_URL = "https://www.bseindia.com/data/xml-data/corpfiling/rss/bse_rss.xml";
