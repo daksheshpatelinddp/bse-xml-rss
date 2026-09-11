@@ -4,7 +4,7 @@
  * Maintained: Ultra-low CPU (<3ms) pointer-based XML parsing & KV logic from worker best cpu time.
  */
 
-const BSE_RSS_URL = "https://www.bseindia.com/data/xml-data/corpfiling/rss/bse_rss.xml";
+const BSE_RSS_URL = "https://www.bseindia.com/data/xml/announcements.xml";
 
 const MAX_RECENT_SEEN = 800;
 const MAX_ALERTS = 500;
