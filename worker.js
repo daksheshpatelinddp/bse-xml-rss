@@ -1,10 +1,10 @@
 /*
  * BSE XML-RSS WORKER – HIGH PERFORMANCE V2.2 (TELEGRAM ONLY)
  * Merged Features: Watchlist CRUD, Notification Settings, Fingerprint Tracking, and Test Endpoints.
- * Maintained: Ultra-low CPU (<3ms) pointer-based XML parsing & KV logic from worker best cpu time.
+ * Maintained: Ultra-low CPU (<3ms) pointer-based XML parsing & KV logic from worker best ct.
  */
 
-const BSE_RSS_URL = "https://www.bseindia.com/data/xml/announcements.xml";
+const BSE_RSS_URL = "https://www.bseindia.com/data/xml-data/corpfiling/rss/bse_rss.xml";
 
 const MAX_RECENT_SEEN = 800;
 const MAX_ALERTS = 500;
@@ -137,17 +137,28 @@ function computeFingerprint(item) {
   return `rss:${scrip}|${title}`;
 }
 
+// Strips everything but letters/digits and lowercases, so formatting
+// differences (spaces, hyphens, "Ltd"/"Limited" punctuation) between a
+// watchlist entry like "ADANIPORTS" and the real announcement title
+// "Adani Ports and Special Economic Zone Ltd" don't cause a missed match.
+// This does NOT fix true abbreviation-style tickers (TCS, GAIL, ONGC, M&M)
+// that aren't literal fragments of the company's full name — those need a
+// real BSE scrip code in the watchlist entry to ever match.
+function normalizeForMatch(s) {
+  return String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
 function matchesWatchlist(item, watchlist) {
   if (!watchlist || !watchlist.length) return false;
   const itemScrip = String(item.scrip || "").trim();
-  const itemCompany = extractCompanyFromTitle(item.title).toLowerCase();
+  const itemCompanyNorm = normalizeForMatch(extractCompanyFromTitle(item.title));
 
   for (let i = 0; i < watchlist.length; i++) {
     const w = watchlist[i];
     const ws = String(w.scrip || "").trim();
     if (ws && itemScrip && ws === itemScrip) return true;
-    const wn = String(w.name || "").toLowerCase().trim();
-    if (wn.length >= 3 && itemCompany && itemCompany.indexOf(wn) !== -1) return true;
+    const wnNorm = normalizeForMatch(w.name);
+    if (wnNorm.length >= 3 && itemCompanyNorm && itemCompanyNorm.indexOf(wnNorm) !== -1) return true;
   }
   return false;
 }
