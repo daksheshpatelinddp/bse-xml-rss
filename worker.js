@@ -3,10 +3,17 @@
  * - Official BSE RSS (XML)
  * - Original fetchedAt is permanent
  * - Alerts only for new watchlist matches
- * - Notifications: Telegram only (ntfy removed)
+ * - Notifications: Telegram only
  * - Burst polling now reads/writes KV once per cron invocation instead of
  *   once per sub-poll, and RSS tag parsing uses precompiled regexes, to
  *   keep CPU time per invocation low (Workers Free plan caps this at 10ms).
+ * - Burst size is time-of-day aware: 2 sub-polls during market hours
+ *   (8:30 AM-3:30 PM IST) for speed, 1 sub-poll outside that window to
+ *   save CPU when timeliness matters less. See getBurstConfig().
+ * - Watchlist matching/alerting per poll is also capped (40 in market
+ *   hours, 15 outside) — items beyond the cap are left unseen and are
+ *   picked up automatically on the next minute's poll instead of being
+ *   dropped. See getMaxMatchesPerPoll().
  *
  * KV binding: BSE_XML_RSS_DATA
  * Secrets: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
@@ -18,8 +25,49 @@ const MAX_RECENT_SEEN = 800;
 const MAX_ALERTS = 500;       // how many watchlist matches to retain in KV history
 const DISPLAY_LIMIT = 50;     // how many of those the frontend feed shows
 
-const BURST_POLLS = 2;
-const BURST_GAP_MS = 20000;
+// Speed matters only during market hours (8:30 AM-3:30 PM IST) — that's
+// when a missed minute could mean missing a fast-moving price reaction.
+// Outside that window (pre-market, post-close, evening) the cron still
+// checks every minute regardless, so nothing is missed for long; the only
+// thing that changes is whether each invocation does a 2-poll burst or a
+// single cheap poll. Cutting the burst outside market hours roughly halves
+// CPU cost for most of the day, while keeping full speed when it matters.
+const MARKET_OPEN_MIN = 8 * 60 + 30;   // 8:30 AM IST, in minutes since midnight
+const MARKET_CLOSE_MIN = 15 * 60 + 30; // 3:30 PM IST
+
+function istMinutesSinceMidnight(epochMs) {
+  // IST is UTC+5:30 with no DST; adding the offset directly to a UTC
+  // timestamp and reading UTC hours/minutes back off it is safe here.
+  const ist = new Date(epochMs + 5.5 * 60 * 60 * 1000);
+  return ist.getUTCHours() * 60 + ist.getUTCMinutes();
+}
+
+function getBurstConfig(epochMs) {
+  const mins = istMinutesSinceMidnight(epochMs);
+  const isMarketHours = mins >= MARKET_OPEN_MIN && mins < MARKET_CLOSE_MIN;
+  return isMarketHours
+    ? { polls: 2, gapMs: 15000 }   // market hours: fast, two sub-polls
+    : { polls: 1, gapMs: 0 };      // outside market hours: single poll, no burst
+}
+
+// Parsing (MAX_ITEMS_PER_POLL) caps how much XML gets scanned, but matching
+// against the watchlist and sending Telegram alerts costs real CPU too —
+// each genuine new match does regex extraction + a fetch call. On an evening
+// with a burst of real announcements (e.g. companies releasing results
+// 7-9 PM), enough matches in a single 60s poll can blow the CPU cap even
+// with parsing already bounded — this happened on 11 Sep, ~20:02-20:56 IST,
+// every single cron tick failing with exceededCpu for ~55 minutes straight.
+// Fix: cap how many new items get matched/alerted per poll. Only the items
+// actually processed this poll are marked "seen" — anything beyond the cap
+// is left unseen, so it's simply picked up and alerted on the very next
+// minute's poll instead of being lost. Speed matters more during market
+// hours, so the cap is higher there; outside market hours, completeness
+// over a few extra minutes is fine per user's stated priority.
+function getMaxMatchesPerPoll(epochMs) {
+  const mins = istMinutesSinceMidnight(epochMs);
+  const isMarketHours = mins >= MARKET_OPEN_MIN && mins < MARKET_CLOSE_MIN;
+  return isMarketHours ? 40 : 15;
+}
 
 const CORS_HEADERS = {
   "Access-Control-Allow-Origin": "*",
@@ -288,6 +336,73 @@ async function saveAlerts(env, alerts) {
   await env.BSE_XML_RSS_DATA.put("specialAlerts", JSON.stringify(alerts.slice(0, MAX_ALERTS)));
 }
 
+// BSE's feed carries the whole trading day's cumulative announcements, and
+// on evenings with heavy mutual-fund/ETF bulk filings this can balloon to
+// thousands of items — several MB of XML. The old code called
+// response.text(), which decodes the ENTIRE body into memory every single
+// poll no matter what MAX_ITEMS_PER_POLL was set to; only the regex scan
+// afterward was bounded. That decode cost scales with total feed size, so
+// it quietly grew worse through the day regardless of any downstream cap —
+// this is the actual reason CPU time crept up specifically in the evening/
+// night as bulk filings accumulated (11 Sep, confirmed via Feeder).
+//
+// Fix: read the response as a stream, decode chunk by chunk, and stop
+// (cancelling the rest of the download) the moment we've seen enough
+// <item> tags for MAX_ITEMS_PER_POLL — the feed is newest-first, so
+// everything after that point is guaranteed to be older/already-seen
+// filings we don't need. This bounds both decode CPU and network transfer
+// to roughly the size of one page, independent of how large the full
+// day's feed has grown.
+async function fetchBoundedXml(response, maxItems) {
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  const scanRe = /<item>/gi;
+  // Defensive fallback only — should never be hit in practice, but avoids
+  // buffering unboundedly if BSE ever changes the feed format so <item>
+  // stops matching as expected.
+  const MAX_BUFFER_BYTES = 3 * 1024 * 1024;
+
+  let buffer = "";
+  let bytesRead = 0;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      bytesRead += value.byteLength;
+      buffer += decoder.decode(value, { stream: true });
+
+      scanRe.lastIndex = 0;
+      let itemCount = 0;
+      let m;
+      while ((m = scanRe.exec(buffer)) !== null) {
+        itemCount++;
+        if (itemCount >= maxItems) break;
+      }
+
+      const haveEnoughItems = itemCount >= maxItems;
+      const hitSafetyCap = bytesRead >= MAX_BUFFER_BYTES;
+      if (!haveEnoughItems && !hitSafetyCap) continue;
+
+      // Try to grab the closing tag of the last item we counted so we
+      // don't hand back a truncated final block; one extra chunk read at
+      // most, then stop regardless.
+      if (buffer.lastIndexOf("</item>") < buffer.lastIndexOf("<item>")) {
+        const extra = await reader.read();
+        if (!extra.done) buffer += decoder.decode(extra.value, { stream: true });
+      }
+      break;
+    }
+  } finally {
+    // This is what actually saves the cost — abandons the rest of the
+    // (possibly much larger) remaining response instead of downloading
+    // and decoding all of it.
+    reader.cancel().catch(() => {});
+  }
+
+  return buffer;
+}
+
 async function fetchRssItems() {
   const response = await fetch(BSE_RSS_URL, {
     method: "GET",
@@ -302,12 +417,13 @@ async function fetchRssItems() {
   });
 
   if (!response.ok) throw new Error(`BSE RSS HTTP ${response.status}`);
-  const xml = await response.text();
+  const xml = await fetchBoundedXml(response, MAX_ITEMS_PER_POLL);
   return parseRssItems(xml);
 }
 
-async function pollOnce(env, cachedWatchlist) {
+async function pollOnce(env, cachedWatchlist, epochMs) {
   const fetchedAt = new Date().toISOString();
+  const maxMatchesPerPoll = getMaxMatchesPerPoll(epochMs || Date.now());
   let items = [];
   try {
     items = await fetchRssItems();
@@ -354,9 +470,19 @@ async function pollOnce(env, cachedWatchlist) {
   let alerts = null;
   let alertFpSet = null;
 
+  // Only the first maxMatchesPerPoll of newOnes get examined this poll.
+  // Everything from here on (updatedSeen, the return value) is built from
+  // processedOnes, not newOnes, so anything beyond the cap stays out of
+  // "seen" and reappears as new on the next minute's poll — deferred, not
+  // dropped.
+  const processedOnes = watchlist.length > 0
+    ? newOnes.slice(0, maxMatchesPerPoll)
+    : newOnes;
+  const deferredCount = newOnes.length - processedOnes.length;
+
   if (watchlist.length > 0) {
-    for (let i = 0; i < newOnes.length; i++) {
-      const { item, fp } = newOnes[i];
+    for (let i = 0; i < processedOnes.length; i++) {
+      const { item, fp } = processedOnes[i];
       if (!matchesWatchlist(item, watchlist)) continue;
 
       if (!alertFpSet) {
@@ -396,8 +522,8 @@ async function pollOnce(env, cachedWatchlist) {
 
   const updatedSeen = [];
   const addSet = new Set();
-  for (let i = 0; i < newOnes.length; i++) {
-    const fp = newOnes[i].fp;
+  for (let i = 0; i < processedOnes.length; i++) {
+    const fp = processedOnes[i].fp;
     if (!addSet.has(fp)) {
       addSet.add(fp);
       updatedSeen.push(fp);
@@ -419,8 +545,9 @@ async function pollOnce(env, cachedWatchlist) {
 
   return {
     ok: true,
-    newAnnouncements: newOnes.length,
+    newAnnouncements: processedOnes.length,
     newAlerts: newAlertCount,
+    deferred: deferredCount,
     rows: items.length,
     totalSeen: updatedSeen.length,
   };
@@ -434,7 +561,9 @@ async function pollOnce(env, cachedWatchlist) {
 // records for genuine new watchlist matches, never rebuilding a large
 // stored list on every poll. That's what makes repeating it BURST_POLLS
 // times affordable within the Workers Free plan's 10ms-per-invocation cap.
-async function pollBurst(env) {
+async function pollBurst(env, epochMs) {
+  const now = epochMs || Date.now();
+  const { polls, gapMs } = getBurstConfig(now);
   const results = [];
   let totalNew = 0;
   let totalAlerts = 0;
@@ -444,19 +573,19 @@ async function pollBurst(env) {
   // KV reads + JSON.parse calls per cron tick.
   const watchlist = await getWatchlist(env);
 
-  for (let i = 0; i < BURST_POLLS; i++) {
-    const r = await pollOnce(env, watchlist);
+  for (let i = 0; i < polls; i++) {
+    const r = await pollOnce(env, watchlist, now);
     results.push(r);
     totalNew += r.newAnnouncements || 0;
     totalAlerts += r.newAlerts || 0;
-    if (i < BURST_POLLS - 1) await sleep(BURST_GAP_MS);
+    if (i < polls - 1) await sleep(gapMs);
   }
 
   return {
     ok: true,
     mode: "burst",
-    polls: BURST_POLLS,
-    gapMs: BURST_GAP_MS,
+    polls,
+    gapMs,
     newAnnouncements: totalNew,
     newAlerts: totalAlerts,
     results,
@@ -549,6 +678,6 @@ if (url.pathname === "/test-alert") {
   },
 
   async scheduled(event, env, ctx) {
-    ctx.waitUntil(pollBurst(env));
+    ctx.waitUntil(pollBurst(env, event.scheduledTime));
   },
 };
