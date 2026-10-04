@@ -46,7 +46,7 @@ function getBurstConfig(epochMs) {
   const mins = istMinutesSinceMidnight(epochMs);
   const isMarketHours = mins >= MARKET_OPEN_MIN && mins < MARKET_CLOSE_MIN;
   return isMarketHours
-    ? { polls: 2, gapMs: 40000 }   // market hours: fast, two sub-polls
+    ? { polls: 2, gapMs: 15000 }   // market hours: fast, two sub-polls
     : { polls: 1, gapMs: 0 };      // outside market hours: single poll, no burst
 }
 
